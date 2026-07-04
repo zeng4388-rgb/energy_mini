@@ -31,8 +31,8 @@ def lnlik(vpar):
             norm[i] = dis.Norm1D_E(vSN0[i], vBW[i], vNpol[i], vG[i], vTs[i],
                                    dnu, vpar[1], vpar[2], vpar[3], vpar[4], vpar[5])
         # 逐事件似然（能量版，对 z 边际化）
-        loglik_fdm = np.zeros(vN.shape)
-        for i in range(len(vN)):
+        loglik_fdm = np.zeros(vFOV.shape)
+        for i in range(len(vFOV)):
             loglik_fdm[i] = np.sum(
                 dis.log_distr_efdmw(dnu, vLOGF_2d[i], vDME_2d[i], vLOGW_2d[i],
                                     vpar[1], vpar[2], vpar[3], vpar[4], vpar[5],
@@ -48,7 +48,9 @@ def lnlik(vpar):
         res = loglik_norm + loglik_poi
         return res
     except Exception:
+        import traceback
         print('Numerical error: @', vpar)
+        traceback.print_exc()
         return -1e99
 
 def myprior(cube, ndim, nparams):
@@ -87,7 +89,7 @@ if __name__ == '__main__':
     parser.add_argument('--fits', action='store_true', dest='use_fits',
                         help='Load catalog from FITS file instead of txt')
     parser.add_argument('--config', action='store', dest='config_path', type=str,
-                        default='config.json', help='Path to config.json')
+                        default='config_mini.json', help='Path to config.json')
 
     args = parser.parse_args()
     fcat = args.fcat
@@ -99,12 +101,15 @@ if __name__ == '__main__':
 
     # 加载全局配置
     config = load_config(args.config_path)
-    dnu = config.get('analysis', {}).get('dnu', 400.0)
+    dnu = config.get('analysis', {}).get('dnu', TELESCOPES['CHIME']['dnu'])
     halo_dm = config.get('analysis', {}).get('halo_dm', 0.0)
-    # 用 config 中的宇宙学参数更新全局 cos 实例
+    # 用 config 中的宇宙学参数创建新实例，并同步到 dis / er
     cosmo_cfg = config.get('cosmology', {})
     cos = Cosmology(omegam=cosmo_cfg.get('Omega_m', 0.308),
                     omegal=cosmo_cfg.get('Omega_L', 0.692))
+    dis.cos = cos
+    er.cos = cos
+    er.ad = dis
 
     # 如果未指定 fcat/fsvy，从 config 读取默认路径
     if fcat is None:
@@ -115,7 +120,7 @@ if __name__ == '__main__':
     if fsvy is None:
         fsvy = config['data']['survey_info_path']
 
-    # 加载数据
+    # 加载数据（已预处理：排除重复暴 + 无 fluence 的 burst）
     if use_fits:
         vF, vW, vDM_obs, vDM_ne2001, vDM_ymw16, vSVY = lf.LoadFitsCatalog(fcat)
         # 根据银河系 DM 模型选择对应的河外 DM
@@ -141,6 +146,8 @@ if __name__ == '__main__':
 
     if fgt and fgt.find('ETG') >= 0:
         fgt = 'ETG'
+
+    print(f'[samp] 加载 {len(vLOGF)} 个已筛查 FRB（one-off，含 fluence）')
 
     # 加载巡天信息
     svy_info = lf.LoadSvyInfo(fsvy)
@@ -176,9 +183,12 @@ if __name__ == '__main__':
     print('------------par range-----------')
     print(vpar_range)
     a1 = time.perf_counter()
-    print(myloglike(vpara, len(vpara), len(vpara)))
+    # sanity check：通过 myprior 变换后再求似然（vpara[0] 是 log_phis，不能直送 lnlik）
+    cube_test = np.zeros(len(vpara))
+    myprior(cube_test, len(vpara), len(vpara))
+    print(myloglike(cube_test, len(vpara), len(vpara)))
     a2 = time.perf_counter()
-    print(a1, a2)
+    print(f'Single eval time: {a2-a1:.3f}s')
     print("Running Nest Sampling ...")
     # run MultiNest
     import os
@@ -189,5 +199,5 @@ if __name__ == '__main__':
                     resume=False,
                     verbose=True,
                     sampling_efficiency='model',
-                    n_live_points=1000,
+                    n_live_points=200,
                     outputfiles_basename=config['output']['nest_out_dir'] + 'samp/' + fout)

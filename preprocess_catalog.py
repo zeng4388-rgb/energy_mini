@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""FRB Catalog preprocessing script
+"""FRB Catalog 预处理脚本
 
-Reads raw FITS catalog, filters by criteria, outputs clean data.
-Analysis code reads preprocessed data, never touching the raw catalog directly.
+读取原始 FITS catalog，按筛选条件过滤，输出干净数据。
+分析代码统一读取预处理后的数据，不直接接触原始 catalog。
 
-Usage:
+用法:
     python preprocess_catalog.py
     python preprocess_catalog.py --input data/chimefrbcat2.fits --output data/filtered
 """
@@ -16,68 +16,68 @@ from astropy.io import fits
 
 
 def load_raw_catalog(fname):
-    """Load raw FITS catalog"""
+    """读取原始 FITS catalog"""
     with fits.open(fname) as hdul:
         data = hdul[1].data
         col_names = data.columns.names
-        print(f"Raw data: {len(data)} bursts")
-        print(f"Column names: {col_names}")
+        print(f"原始数据: {len(data)} 个 burst")
+        print(f"列名: {col_names}")
         return data, col_names
 
 
 def filter_minimum(data):
-    """Minimum filter: only exclude repeaters and bursts without fluence
+    """最小筛选：只排除重复暴和无fluence的burst
 
-    Filter criteria:
-    1. repeater_name is empty -> one-off FRB
-    2. fluence is not NaN -> has valid flux measurement
+    筛选标准:
+    1. repeater_name 为空 → one-off FRB
+    2. fluence 不为 NaN → 有有效通量测量
     """
     n_raw = len(data)
 
-    # exclude repeaters
+    # 排除重复暴
     rep = np.array(data['repeater_name'])
     is_oneoff = np.array([str(r).strip() == '' for r in rep])
     n_after_rep = np.sum(is_oneoff)
 
-    # exclude bursts without fluence
+    # 排除无fluence
     fluence = np.array(data['fluence'], dtype=float)
     has_fluence = ~np.isnan(fluence)
     n_after_fluence = np.sum(is_oneoff & has_fluence)
 
-    # combined filter
+    # 组合筛选
     mask = is_oneoff & has_fluence
     filtered = data[mask]
 
-    print(f"\nFilter results:")
-    print(f"  Raw:         {n_raw}")
-    print(f"  Drop repeaters: {n_raw} -> {n_after_rep} (excluded {n_raw - n_after_rep})")
-    print(f"  Drop no-fluence: {n_after_rep} -> {n_after_fluence} (excluded {n_after_rep - n_after_fluence})")
-    print(f"  Final sample: {n_after_fluence} one-off FRBs")
+    print(f"\n筛选结果:")
+    print(f"  原始:        {n_raw}")
+    print(f"  排除重复暴:  {n_raw} → {n_after_rep} (排除 {n_raw - n_after_rep})")
+    print(f"  排除无fluence: {n_after_rep} → {n_after_fluence} (排除 {n_after_rep - n_after_fluence})")
+    print(f"  最终样本:    {n_after_fluence} 个 one-off FRB")
 
     return filtered
 
 
 def extract_columns(data):
-    """Extract analysis columns, unify units
+    """提取分析所需列，统一单位
 
-    Output columns:
-    - name: FRB name
-    - fluence: flux x duration [Jy ms]
-    - width: pulse width [ms] (converted from seconds)
-    - dm_obs: observed dispersion measure [pc cm^-3]
-    - dm_exc_ne2001: DM - DM_MW(NE2001) [pc cm^-3]
-    - dm_exc_ymw16: DM - DM_MW(YMW16) [pc cm^-3]
+    输出列:
+    - name: FRB 名称
+    - fluence: 通量×持续时间 [Jy·ms]
+    - width: 脉冲宽度 [ms]（从秒转换）
+    - dm_obs: 观测色散量 [pc·cm⁻³]
+    - dm_exc_ne2001: DM - DM_MW(NE2001) [pc·cm⁻³]
+    - dm_exc_ymw16: DM - DM_MW(YMW16) [pc·cm⁻³]
     """
     n = len(data)
     result = {}
 
-    # name
+    # 名称
     result['name'] = np.array(data['tns_name'])
 
-    # fluence [Jy ms]
+    # fluence [Jy·ms]
     result['fluence'] = np.array(data['fluence'], dtype=float)
 
-    # width: CHIME bc_width is in seconds, convert to milliseconds
+    # width: CHIME bc_width 单位是秒，转为毫秒
     width = np.array(data['bc_width'], dtype=float)
     med_w = np.nanmedian(width)
     if np.isfinite(med_w) and med_w < 1.0:
@@ -92,12 +92,43 @@ def extract_columns(data):
     return result
 
 
+def filter_quality(result):
+    """数据质量筛选：在 extract_columns 之后对 result 字典操作
+
+    筛选标准:
+    1. width 为有限正数（排除 NaN 和 ≤0）
+    2. dm_exc_ne2001 和 dm_exc_ymw16 至少一个为正（排除同时为负）
+    """
+    n_before = len(result['width'])
+
+    # width 有效：有限正数
+    valid_width = np.isfinite(result['width']) & (result['width'] > 0)
+    n_after_width = np.sum(valid_width)
+
+    # DM_exc 至少一个为正
+    has_pos_dm = (result['dm_exc_ne2001'] > 0) | (result['dm_exc_ymw16'] > 0)
+    n_after_dm = np.sum(valid_width & has_pos_dm)
+
+    mask = valid_width & has_pos_dm
+
+    print(f"\n质量筛选结果:")
+    print(f"  质量筛选前:        {n_before}")
+    print(f"  排除无效 width:    {n_before} → {n_after_width} (排除 {n_before - n_after_width})")
+    print(f"  排除双负 DM_exc:   {n_after_width} → {n_after_dm} (排除 {n_after_width - n_after_dm})")
+    print(f"  质量筛选后样本:    {n_after_dm} 个 FRB")
+
+    for key in result:
+        result[key] = result[key][mask]
+
+    return result
+
+
 def save_fits(result, fname):
-    """Save as FITS format"""
+    """保存为 FITS 格式"""
     cols = []
     for key in result:
         if result[key].dtype.kind in ('U', 'S'):
-            # string column: use max length to avoid truncation
+            # 字符串列：使用最大长度避免截断
             max_len = max(len(s) for s in result[key])
             col = fits.Column(name=key, format=f'{max_len}A', array=result[key])
         else:
@@ -115,15 +146,15 @@ def save_fits(result, fname):
 
 
 def save_txt(result, fname):
-    """Save as TXT format (space-delimited, first row is column names)"""
+    """保存为 TXT 格式（空格分隔，首行为列名）"""
     keys = list(result.keys())
     header = ' '.join(keys)
 
-    # separate string columns and numeric columns
+    # 分离字符串列和数值列
     str_keys = [k for k in keys if result[k].dtype.kind in ('U', 'S', 'O')]
     num_keys = [k for k in keys if result[k].dtype.kind not in ('U', 'S', 'O')]
 
-    # write with mixed format
+    # 用混合格式写入
     with open(fname, 'w') as f:
         f.write(f'# {header}\n')
         for i in range(len(result[keys[0]])):
@@ -139,48 +170,52 @@ def save_txt(result, fname):
 
 
 def print_summary(result):
-    """Print data summary"""
-    print(f"\nData summary:")
+    """打印数据摘要"""
+    print(f"\n数据摘要:")
     for key in result:
         vals = result[key]
         if vals.dtype.kind in ('U', 'S', 'O'):
-            print(f"  {key:>15}: {len(vals)} entries")
+            print(f"  {key:>15}: {len(vals)} 条")
         else:
             print(f"  {key:>15}: min={np.nanmin(vals):.4f}  max={np.nanmax(vals):.4f}  median={np.nanmedian(vals):.4f}")
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='FRB Catalog preprocessing')
+    parser = argparse.ArgumentParser(description='FRB Catalog 预处理')
     parser.add_argument('-i', '--input', default='data/chimefrbcat2.fits',
-                        help='Input FITS file path')
+                        help='输入 FITS 文件路径')
     parser.add_argument('-o', '--output', default='data/filtered',
-                        help='Output file path (without extension)')
+                        help='输出文件路径（不含扩展名）')
     args = parser.parse_args()
 
     print("=" * 50)
-    print("FRB Catalog Preprocessing")
+    print("FRB Catalog 预处理")
     print("=" * 50)
 
-    # 1. load raw data
-    print(f"\n[1/4] Load raw data: {args.input}")
+    # 1. 加载原始数据
+    print(f"\n[1/5] 加载原始数据: {args.input}")
     data, col_names = load_raw_catalog(args.input)
 
-    # 2. filter
-    print(f"\n[2/4] Minimum filter (exclude repeaters + no-fluence)")
+    # 2. 筛选
+    print(f"\n[2/5] 最小筛选（排除重复暴 + 无fluence）")
     filtered = filter_minimum(data)
 
-    # 3. extract columns and convert units
-    print(f"\n[3/4] Extract columns and convert units")
+    # 3. 提取列并转换单位
+    print(f"\n[3/5] 提取列并转换单位")
     result = extract_columns(filtered)
     print_summary(result)
 
-    # 4. save
-    print(f"\n[4/4] Save preprocessed data")
+    # 4. 数据质量筛选
+    print(f"\n[4/5] 数据质量筛选（无效 width + 双负 DM_exc）")
+    result = filter_quality(result)
+
+    # 5. 保存
+    print(f"\n[5/5] 保存预处理数据")
     fits_out = args.output + '.fits'
     txt_out = args.output + '.txt'
     Path(fits_out).parent.mkdir(parents=True, exist_ok=True)
     save_fits(result, fits_out)
     save_txt(result, txt_out)
 
-    print(f"\nDone! Analysis code uses preprocessed data:")
+    print(f"\n完成！分析代码使用预处理后的数据:")
     print(f'  config.json: "catalog_path": "{fits_out}"')

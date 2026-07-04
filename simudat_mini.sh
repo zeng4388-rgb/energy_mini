@@ -1,0 +1,40 @@
+#!/bin/sh
+
+# FRB number (缩减: 100 -> 20)
+Nfrb=20
+
+# E_iso energy function parameters
+alpha=-1.5
+logEs=43.0
+logE0=38.0
+dnu=400
+
+# Width parameters
+mu=0.4
+sigma=0.3
+
+# Selection criteria
+np=2
+sn0=10
+
+# CHIME 望远镜参数 (从 tel_svy.txt)
+g=1.4
+bw=400
+Ts=50
+fov=200
+
+# Host galaxy categories
+galaxy_type=ALG_YMW16
+
+# 创建输出目录
+mkdir -p simu_mini
+
+# 缩减: 只跑 phis=1e3 一组
+for phis in 1e3
+do
+    outputfile=./simu_mini/simdat_${phis}_${fov}.txt
+    echo "python3 simufrb.py -ns $Nfrb -phis $phis -alpha $alpha -logEs $logEs -logE0 $logE0 -dnu $dnu -fgt $galaxy_type -mu ${mu} -sig ${sigma} -ga $g -npol $np -bw $bw -ts $Ts -sn0 $sn0 -fov $fov -out $outputfile --config config_mini.json"
+    python3 simufrb.py -ns $Nfrb -phis $phis -alpha $alpha -logEs $logEs -logE0 $logE0 -dnu $dnu -fgt $galaxy_type -mu ${mu} -sig ${sigma} -ga $g -npol $np -bw $bw -ts $Ts -sn0 $sn0 -fov $fov -out $outputfile --config config_mini.json
+done
+wait
+exit

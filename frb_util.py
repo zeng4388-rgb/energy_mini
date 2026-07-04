@@ -6,12 +6,41 @@ import scipy.special as spf
 import json
 from pathlib import Path
 
-def load_config(config_path='config.json'):
-    with open(Path(__file__).parent / config_path) as f:
+def load_config(config_path='config_mini.json'):
+    """加载全局配置文件
+
+    路径解析规则：
+    - 绝对路径：直接使用
+    - 相对路径：基于当前工作目录(CWD)解析，而非脚本所在目录
+    默认文件名 config_mini.json 对应本项目实际使用的配置文件。
+    """
+    p = Path(config_path)
+    if not p.is_absolute():
+        p = Path.cwd() / p
+    with open(p) as f:
         return json.load(f)
 
+# FRB 谱指数，参考 Shin 2023
+ALPHA_SPEC = -1.39
+
+# 望远镜参数库（硬编码，方便后续扩展）
+# dnu: 观测帧带宽 Δν_obs [MHz]
+TELESCOPES = {
+    'CHIME': {
+        'g': 1.4,        # Gain [K/Jy]
+        'bw': 400,       # Bandwidth [MHz] (观测帧)
+        'tsys': 50.0,    # System temperature [K]
+        'fov': 200.0,    # Field of view [deg^2]
+        'npol': 2,       # Polarization channels
+        'sn0': 10.0,     # Detection threshold SNR
+        'dnu': 400.0,    # 观测带宽 Δν_obs [MHz] (400-800 MHz)
+    },
+    # 后续加新望远镜在这里添加：
+    # 'Parkes': {'g': 0.6, 'bw': 300, 'tsys': 25, 'fov': 4.0, 'npol': 2, 'sn0': 10, 'dnu': 300},
+}
+
 class Cosmology:
-    _cache = {}  # (omegam, omegal, omegab) -> instance
+    _cache = {}  # (omegam, omegal, omegab) -> instance，避免重复积分
 
     def __init__(self, omegam=0.308, omegal=0.692, omegab=0.0484):
         key = (omegam, omegal, omegab)
@@ -105,16 +134,20 @@ class Cosmology:
         lum = f * self.Jy2CGS * dnu * self.MHz2Hz * 4 * np.pi * ld2
         return lum
 
-    def Energy(self, z, flu=1.0, dnu=1000.):
-        """
-        calculate the intrinsic energy from fluence
-        flu: fluence in units of Jy ms
-        dnu: intrinsic spectral width, default at 1000 MHz
+    def Energy(self, z, flu=1.0, dnu=400.):
+        """计算内禀能量 E_iso
+
+        公式: E = 4π D_L² · Δν_obs · F / (1+z)^(1+α)
+        其中 α = -1.39 (FRB 谱指数, Shin 2023)
+        等价于: E = 4π D_L² · Δν_em · F / (1+z)^(2+α)
+
+        flu: fluence [Jy·ms]
+        dnu: 观测帧带宽 Δν_obs [MHz]
         z: redshift
         """
         ld = self.Luminosity_Distance(z)
         ld2 = ld * ld
-        ener = flu / (1+z) * self.Jyms2CGS * dnu * self.MHz2Hz * 4 * np.pi * ld2
+        ener = flu * self.Jyms2CGS * dnu * self.MHz2Hz * 4 * np.pi * ld2 / np.power(1+z, 1 + ALPHA_SPEC)
         return ener
     
     def LuminosityDistance_to_z(self, ld):
@@ -146,20 +179,21 @@ class Cosmology:
         flux = lum/4/np.pi/ld2/dnu/self.MHz2Hz/self.Jy2CGS
         return flux
     
-    def Energy_to_Flu(self, z, ener, dnu=1000):
-        """
-        calculate the observed fluence when knowing intrinsic energy
+    def Energy_to_Flu(self, z, ener, dnu=400.):
+        """从内禀能量反推观测 fluence (Energy 的反函数)
+
+        公式: F = E · (1+z)^(1+α) / (4π D_L² · Δν_obs)
         """
         ld = self.Luminosity_Distance(z)
         ld2 = ld*ld
-        flu = ener*(1+z)/4/np.pi/ld2/dnu/self.MHz2Hz/self.Jyms2CGS
+        flu = ener * np.power(1+z, 1 + ALPHA_SPEC) / 4 / np.pi / ld2 / dnu / self.MHz2Hz / self.Jyms2CGS
         return flu
 
     def DMeq(self, z, dme, dmhost):
         """
         The DM equation which is solved to get redshift value
         """
-        z = np.maximum(z, 1e-7)   # protect interpolator from negative z
+        z = np.maximum(z, 1e-7)   # fsolve 可能试探负值，保护插值器
         dmi = self.DispersionMeasure_IGM(z)
         dmh = dmhost/(1+z)
         return dmi + dmh - dme
@@ -223,17 +257,17 @@ class AstroDistribution:
              ratio = np.power(10., logl0-logls)
         return gammainc(alpha+1, ratio/eps)
 
-    # --- E_iso energy function aliases ---
+    # --- E_iso 能量函数别名（数学形式与光度函数完全相同） ---
     def Schechter_E_log(self, loge, phis, alpha, logEs):
-        """Schechter energy function per dex (same form as Schechter_log)"""
+        """Schechter 能量函数 per dex（与 Schechter_log 数学形式相同）"""
         return self.Schechter_log(loge, phis, alpha, logEs)
 
     def IntE(self, eps, alpha, logEs, logE_min):
-        """Schechter energy cumulative integral (same as IntLum)"""
+        """Schechter 能量累积积分（与 IntLum 数学形式相同）"""
         return self.IntLum(eps, alpha, logEs, logE_min)
 
     def log_IntBeam_E(self, loge, alpha, logEs, logE0):
-        """Beam-convolved Schechter energy function (same as log_IntBeam)"""
+        """波束卷积后的 Schechter 能量函数（与 log_IntBeam 数学形式相同）"""
         return self.log_IntBeam(loge, alpha, logEs, logE0)
     
     def Distribution_Local_galaxy_DM(self, dmv, vpar):
@@ -311,7 +345,10 @@ class AstroDistribution:
             res[dmv0<=0] = np.zeros(res[dmv0<=0].shape)
             return res
         else:
-            return fgalaxy_type(dmv0,vpar)
+            if callable(fgalaxy_type):
+                return fgalaxy_type(dmv0, vpar)
+            raise ValueError(f"未识别的 fgalaxy_type: {fgalaxy_type!r}，"
+                             f"可选: ETG / LTG_NE2001 / LTG_YMW16 / ALG_NE2001 / ALG_YMW16 或自定义可调用对象")
     
     
     def log_Distribution_HostGalaxyDM(self, dmv, fgalaxy_type=None, vpar=np.array([0,50])):
@@ -336,13 +373,35 @@ class AstroDistribution:
         Star-forming history, the values taken from Hopkins & Beacom (2016)
         """
         sfr = (0.017 + 0.13 * z)/(1 + np.power(z/3.3, 5.3))
-        return sfr 
+        return sfr
+
+    def SFR_evolution(self, z):
+        """
+        Star-formation rate history, adopted from Yuksel et al. (2008)
+        用于 FRB 事件率密度的宇宙学演化
+        """
+        a = 3.4; b = -0.3; c = -3.5; B = 5e3; C = 9; eta = -10
+        p1 = np.power(1+z, a*eta)
+        p2 = np.power((1+z)/B, b*eta)
+        p3 = np.power((1+z)/C, c*eta)
+        p = p1+p2+p3
+        return np.power(p, 1./eta)
+
+    def evolution_factor(self, z):
+        """FRB 事件率宇宙学演化因子，归一化到 z=0
+
+        返回 SFR_evolution(z) / SFR_evolution(0)，使 phis 代表本地事件率密度
+        """
+        return self.SFR_evolution(z) / self.SFR_evolution(0.0)
 
     def kappa(self, z):
         """
         Normalized SFH from redshift of z to redshift of 0 (nearby universe)
+
+        统一使用 SFR_evolution（Yuksel et al. 2008），与 evolution_factor / 事件率
+        演化保持同一套 SFR 曲线，避免 mock 数据与推断端 DM-z 关系错位。
         """
-        return np.sqrt(self.SFR(0)/self.SFR(z))
+        return np.sqrt(self.SFR_evolution(0)/self.SFR_evolution(z))
 
     def Distribution_volume(self, z):
         """
@@ -392,7 +451,6 @@ class AstroDistribution:
         Logarithmic integrals of above marginalization in different galaxy type cases
         """
         if not gtype:
-            gtype = self.func_gaussian
             res = np.log(np.maximum(self.IntDMsrc(u1, u2, np.array([0, 50])), 1e-300))
             return res
         elif gtype == 'ETG':
@@ -442,17 +500,17 @@ class AstroDistribution:
         ind = u2 > 0
         logint2[ind] = self.log_IntDMsrc(u1[ind],u2[ind],gtype=gtype)
         #print logint2
-        loglikv = logint1 + logfz + logfw + logint2 + np.log(1+z)
+        loglikv = logint1 + logfz + logfw + logint2 + np.log(1+z) + np.log(self.evolution_factor(z))
         return loglikv
 
     def log_distr_efdmwz(self, dnu, logflux, dme, logw, z, alpha, logEs, logE0, mu, sigma, gtype=None):
-        """Joint distribution p(E_iso, DM_host | z)
+        """能量版联合概率 p(E_iso, DM_host | z)
 
-        Coupling flux and width to E_iso, evaluated with Schechter energy function.
-        E_iso = S * w * dnu * 4pi * D_L^2 / (1+z)
+        将观测流量 logflux 和脉冲宽度 logw 耦合为 E_iso，再用 Schechter 能量函数评估。
+        物理关系：E_iso = S * w * dnu * 4π * D_L² / (1+z)
         """
         flux = np.power(10., logflux)
-        w_ms = np.power(10., logw)       # pulse width [ms]
+        w_ms = np.power(10., logw)       # 脉冲宽度 [ms]
         fluence = flux * w_ms            # fluence = S * w [Jy·ms]
         loge = np.log10(self.cos.Energy(z, flu=fluence, dnu=dnu))
         logint1 = self.log_IntBeam_E(loge, alpha, logEs, logE0)
@@ -465,7 +523,7 @@ class AstroDistribution:
         logint2 = np.ones(u2.shape) * (-1e99)
         ind = u2 > 0
         logint2[ind] = self.log_IntDMsrc(u1[ind],u2[ind],gtype=gtype)
-        loglikv = logint1 + logfz + logfw + logint2 + np.log(1+z)
+        loglikv = logint1 + logfz + logfw + logint2 + np.log(1+z) + np.log(self.evolution_factor(z))
         return loglikv
 
     def log_distr_fdmw(self, dnu, logflux, dme, logw, alpha, logls, logl0, mu, sigma, gtype=None):
@@ -482,7 +540,7 @@ class AstroDistribution:
         """
         #stepdms = 100/1000.
         #vdms = np.arange(0, 100, stepdm)
-        stepz = (np.log(self.Zmax) - np.log(self.Zmin)) / 1000
+        stepz = (np.log(self.Zmax) - np.log(self.Zmin)) / 100.
         vz = np.exp(np.arange(np.log(self.Zmin), np.log(self.Zmax), stepz))
         lik = 0
         for z in vz:
@@ -496,11 +554,11 @@ class AstroDistribution:
         return loglik
 
     def log_distr_efdmw(self, dnu, logflux, dme, logw, alpha, logEs, logE0, mu, sigma, gtype=None):
-        """Energy-domain joint distribution, marginalized over redshift z.
+        """能量版联合概率，对红移 z 边际化
 
-        For events with known redshift, use log_distr_efdmwz directly.
+        对于有红移的事件，可直接使用 log_distr_efdmwz；本函数用于仅有 DM 的事件。
         """
-        stepz = (np.log(self.Zmax) - np.log(self.Zmin)) / 200
+        stepz = (np.log(self.Zmax) - np.log(self.Zmin)) / 100.
         vz = np.exp(np.arange(np.log(self.Zmin), np.log(self.Zmax), stepz))
         lik = 0
         for z in vz:
@@ -514,14 +572,16 @@ class AstroDistribution:
         return loglik
     
     def Norm1D(self, sn0, bw, npol, g, tsys, dnu, alpha, logls, logl0, mu, sigma):
+        """Normalization factor for dimensionless likelihood
+
+        注意：此为光度函数版归一化（死代码，当前 mini 管线无调用）。
+        若未来启用，需同步 C1 修复：在 fz 中补 / (1+z) 时间膨胀因子。
         """
-        Normalization factor for dimensionless likelihood
-        """
-        stepz = (np.log(self.Zmax) - np.log(self.Zmin)) / 1000.
+        stepz = (np.log(self.Zmax) - np.log(self.Zmin)) / 100.
         vz = np.exp(np.arange(np.log(self.Zmin), np.log(self.Zmax), stepz))
-        stepeps = (1-0.5) / 200.
+        stepeps = (1-0.5) / 50.
         veps = np.arange(0.5, 1, stepeps)
-        steplogw = (np.log10(self.Wmax) - np.log10(self.Wmin)) / 1000.
+        steplogw = (np.log10(self.Wmax) - np.log10(self.Wmin)) / 100.
         vlogw = np.arange(np.log10(self.Wmin), np.log10(self.Wmax), steplogw)
         nf = 0
         for z in vz:
@@ -535,18 +595,18 @@ class AstroDistribution:
             for i in np.arange(len(loglt)):
                 int_eps[i] = np.sum(self.IntLum(veps, alpha, logls, loglt[i]*np.ones(veps.shape))/veps/np.log(2)*stepeps)
             int_w = np.sum(int_eps*self.dis_logw(vlogw, mu, sigma)*steplogw)
-            fz = self.Distribution_volume(z)
+            fz = self.Distribution_volume(z) * self.evolution_factor(z)
             nf += z*stepz*fz*int_w
         if nf <= 0:
             nf = 1e-199
         return nf
 
     def Norm1D_E(self, sn0, bw, npol, g, tsys, dnu, alpha, logEs, logE0, mu, sigma):
-        """Energy-domain normalization factor.
+        """能量版归一化因子
 
-        Detection threshold: E_min = S_min * w_obs * dnu * 4pi * D_L^2 / (1+z)
+        检测阈值从 L_min 转换为 E_min：E_min = S_min * w_obs * dnu * 4π * D_L² / (1+z)
         """
-        stepz = (np.log(self.Zmax) - np.log(self.Zmin)) / 200.
+        stepz = (np.log(self.Zmax) - np.log(self.Zmin)) / 100.
         vz = np.exp(np.arange(np.log(self.Zmin), np.log(self.Zmax), stepz))
         stepeps = (1-0.5) / 50.
         veps = np.arange(0.5, 1, stepeps)
@@ -564,7 +624,9 @@ class AstroDistribution:
             for i in np.arange(len(loget)):
                 int_eps[i] = np.sum(self.IntE(veps, alpha, logEs, loget[i]*np.ones(veps.shape))/veps/np.log(2)*stepeps)
             int_w = np.sum(int_eps*self.dis_logw(vlogw, mu, sigma)*steplogw)
-            fz = self.Distribution_volume(z)
+            # 期望检测数 <N> = T_obs · ∫ dz [dV/dz · R(z) / (1+z)] · ∫ dlogw φ(E_min)·p(w)·P_det
+            # /(1+z) 为源帧→观测帧时间膨胀因子，与 rate_2d_E / simufrb.py 采样端保持一致
+            fz = self.Distribution_volume(z) * self.evolution_factor(z) / (1.0 + z)
             nf += z*stepz*fz*int_w
         if nf <= 0:
             nf = 1e-199
@@ -572,6 +634,10 @@ class AstroDistribution:
 
 class EventRate:
     def __init__(self):
+        # 注意：self.ad 是独立创建的 AstroDistribution 实例，默认宇宙学。
+        # 调用方若修改了宇宙学参数（如从 config 读取），必须显式同步：
+        #     er.cos = cos; er.ad = dis
+        # 否则 rate_2d_E 等方法会用 self.ad 的默认宇宙学，与外部 dis 不一致。
         self.cos = Cosmology()
         self.ad = AstroDistribution()
         self.tel = Telescope()
@@ -581,11 +647,11 @@ class EventRate:
         self.Gpc2Mpc = 1e3
  
     def rate_2d(self, sn0, bw, npol, g, tsys, dnu, phis, alpha, logls, logl0, mu, sigma):
-        stepz = (np.log(self.ad.Zmax) - np.log(self.ad.Zmin)) / 1000.
+        stepz = (np.log(self.ad.Zmax) - np.log(self.ad.Zmin)) / 100.
         vz = np.exp(np.arange(np.log(self.ad.Zmin), np.log(self.ad.Zmax), stepz))
-        stepeps = (1-0.5)/ 200.
+        stepeps = (1-0.5)/ 50.
         veps = np.arange(0.5, 1, stepeps)
-        steplogw = (np.log10(self.ad.Wmax) - np.log10(self.ad.Wmin)) / 1000.
+        steplogw = (np.log10(self.ad.Wmax) - np.log10(self.ad.Wmin)) / 100.
         vlogw = np.arange(np.log10(self.ad.Wmin), np.log10(self.ad.Wmax), steplogw)
         rho = 0
         for z in vz:
@@ -599,17 +665,17 @@ class EventRate:
             for i in range(len(loglt)):
                 int_eps[i] = np.sum(phis*self.ad.IntLum(veps, alpha, logls, loglt[i]*np.ones(veps.shape))/veps/np.log(2)*stepeps)
             int_w = np.sum(int_eps*self.ad.dis_logw(vlogw, mu, sigma)*steplogw)
-            fz = self.cos.dVdOdz(z)/(1+z)
+            fz = self.cos.dVdOdz(z)/(1+z) * self.ad.evolution_factor(z)
             rho += z*stepz*fz*int_w
         rho_deg = rho/self.rad2deg2/self.yr2hr
         return rho_deg
 
     def rate_2d_E(self, sn0, bw, npol, g, tsys, dnu, phis, alpha, logEs, logE0, mu, sigma):
-        """Energy-domain event rate density rho_deg [deg^-2 hr^-1].
+        """能量版事件率密度 rho_deg [deg^-2 hr^-1]
 
-        Detection threshold: E_min = S_min * w_obs * dnu * 4pi * D_L^2 / (1+z)
+        检测阈值从 L_min 转换为 E_min：E_min = S_min * w_obs * dnu * 4π * D_L² / (1+z)
         """
-        stepz = (np.log(self.ad.Zmax) - np.log(self.ad.Zmin)) / 200.
+        stepz = (np.log(self.ad.Zmax) - np.log(self.ad.Zmin)) / 100.
         vz = np.exp(np.arange(np.log(self.ad.Zmin), np.log(self.ad.Zmax), stepz))
         stepeps = (1-0.5)/ 50.
         veps = np.arange(0.5, 1, stepeps)
@@ -627,7 +693,7 @@ class EventRate:
             for i in range(len(loget)):
                 int_eps[i] = np.sum(phis*self.ad.IntE(veps, alpha, logEs, loget[i]*np.ones(veps.shape))/veps/np.log(2)*stepeps)
             int_w = np.sum(int_eps*self.ad.dis_logw(vlogw, mu, sigma)*steplogw)
-            fz = self.cos.dVdOdz(z)/(1+z)
+            fz = self.cos.dVdOdz(z)/(1+z) * self.ad.evolution_factor(z)
             rho += z*stepz*fz*int_w
         rho_deg = rho/self.rad2deg2/self.yr2hr
         return rho_deg
@@ -640,9 +706,9 @@ class EventRate:
         return loglik
 
     def Sens(self, sn0, g, tsys, npol, bw, mu, sigma):
-        stepz = (np.log(self.ad.Zmax) - np.log(self.ad.Zmin)) / 1000.
+        stepz = (np.log(self.ad.Zmax) - np.log(self.ad.Zmin)) / 100.
         vz = np.exp(np.arange(np.log(self.ad.Zmin), np.log(self.ad.Zmax), stepz))
-        steplogw = (np.log10(self.ad.Wmax) - np.log10(self.ad.Wmin)) / 1000.
+        steplogw = (np.log10(self.ad.Wmax) - np.log10(self.ad.Wmin)) / 100.
         vlogw = np.arange(np.log10(self.ad.Wmin), np.log10(self.ad.Wmax), steplogw)
         ints0 = 0
         intz = 0
@@ -655,11 +721,11 @@ class EventRate:
         return smin
 
     def Rate(self, logft, dnu, phis, alpha, logls, logl0, mu, sigma):
-        stepz = (np.log(self.ad.Zmax) - np.log(self.ad.Zmin)) / 1000.
+        stepz = (np.log(self.ad.Zmax) - np.log(self.ad.Zmin)) / 100.
         vz = np.exp(np.arange(np.log(self.ad.Zmin), np.log(self.ad.Zmax), stepz))
-        stepeps = (1-0.5) / 200.
+        stepeps = (1-0.5) / 50.
         veps = np.arange(0.5, 1, stepeps)
-        steplogw = (np.log10(self.ad.Wmax) - np.log10(self.ad.Wmin)) / 1000.
+        steplogw = (np.log10(self.ad.Wmax) - np.log10(self.ad.Wmin)) / 100.
         vlogw = np.arange(np.log10(self.ad.Wmin), np.log10(self.ad.Wmax), steplogw)
         rho = 0
         for z in vz:
@@ -679,8 +745,8 @@ class EventRate:
         return rho_deg
 
     def Rate_E(self, logft, dnu, phis, alpha, logEs, logE0, mu, sigma):
-        """Energy-domain event rate (single flux threshold)."""
-        stepz = (np.log(self.ad.Zmax) - np.log(self.ad.Zmin)) / 200.
+        """能量版事件率（对单一 flux 阈值）"""
+        stepz = (np.log(self.ad.Zmax) - np.log(self.ad.Zmin)) / 100.
         vz = np.exp(np.arange(np.log(self.ad.Zmin), np.log(self.ad.Zmax), stepz))
         stepeps = (1-0.5) / 50.
         veps = np.arange(0.5, 1, stepeps)
@@ -706,7 +772,7 @@ class EventRate:
         return phis*gammainc(alpha+1, ratio)
 
     def Rfrb_E(self, phis, alpha, logEs, logEmin):
-        """Energy-domain event rate (single energy threshold)."""
+        """能量版事件率（对单一能量阈值）"""
         ratio = np.power(10., logEmin-logEs)
         return phis*gammainc(alpha+1, ratio)   
 
@@ -714,7 +780,13 @@ class Loadfiles:
     #def __init__(self):
 
     def LoadCatalogue(self, fname):
-        """Legacy TXT loader for hand-curated catalog format."""
+        """[DEPRECATED] 遗留 TXT 加载器
+
+        注意：此加载器期望的列名（S/Seu/Sel/W/.../SURVEY/Gain/...）与
+        preprocess_catalog.py 输出的 TXT 格式（name/fluence/width/dm_obs/...）
+        完全不兼容。mini 管线默认走 --fits 路径（LoadFitsCatalog）。
+        若需使用 TXT 路径，需先手动整理为兼容格式或新增适配器。
+        """
         cat = np.loadtxt(fname, dtype=str)
         row, col = cat.shape
         cat2 = {}
@@ -758,27 +830,59 @@ class Loadfiles:
         return cat2
 
     def LoadSimuData(self, fname):
-        """Load simulated FRB data (# header, space-delimited)."""
+        """读取模拟 FRB 数据文件
+
+        Header 格式（# 开头）：
+          #T_obs 26280.0                          ← 可选的 key-value 元数据
+          #S W T DMe thres logE Z DMi DMh DMs      ← 列名
+
+        若 header 中包含 T_obs，则返回字典中会包含 'T_obs' 键。
+        """
+        col_names = None
+        t_obs = None
         with open(fname) as f:
-            header_line = f.readline().strip()
-            if header_line.startswith('#'):
-                header_line = header_line[1:]
-            col_names = header_line.split()
-        cat = np.loadtxt(fname, dtype=float, comments='#', skiprows=1)
+            for line in f:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                if stripped.startswith('#'):
+                    content = stripped[1:].strip()
+                    if content.startswith('T_obs'):
+                        parts = content.split()
+                        if len(parts) >= 2:
+                            t_obs = float(parts[1])
+                    elif col_names is None:
+                        col_names = content.split()
+                else:
+                    break
+        if col_names is None:
+            raise ValueError(f"无法从 {fname} 的 header 中解析列名")
+
+        cat = np.loadtxt(fname, dtype=float, comments='#')
         cat2 = {}
         for i, name in enumerate(col_names):
             cat2[name] = cat[:, i]
+        if t_obs is not None:
+            cat2['T_obs'] = t_obs
         return cat2
 
     def LoadFitsCatalog(self, fname):
-        """Load CHIME/FRB Catalog 2 FITS file.
+        """读取 CHIME/FRB Catalog 2 FITS 文件
 
-        Returns: vF(fluence Jy ms), vW(width ms), vDM_obs, vDM_ne2001, vDM_ymw16, vSVY
+        返回: vF(fluence Jy·ms), vW(width ms), vDM_obs, vDM_ne2001, vDM_ymw16, vSVY
+
+        CHIME Catalog 2 关键列名:
+          fluence, fluence_err — fluence 及误差 [Jy ms]
+          bc_width — 校准后脉冲宽度 [ms]
+          dm_fitb — 拟合 DM [pc cm^-3]
+          dm_exc_ne2001 — DM - DM_MW(NE2001)，即河外 DM
+          dm_exc_ymw16 — DM - DM_MW(YMW16)，即河外 DM
+          红移：Catalog 2 中无红移列，需后续用 P(z|DM) 处理
         """
         try:
             from astropy.io import fits
         except ImportError:
-            raise ImportError("astropy required: pip install astropy")
+            raise ImportError("需要安装 astropy: pip install astropy")
 
         with fits.open(fname) as hdul:
             data = hdul[1].data
@@ -787,47 +891,43 @@ class Loadfiles:
             # === fluence ===
             fluence_key = next((k for k in ['fluence', 'Fluence'] if k in col_names), None)
             if fluence_key is None:
-                raise KeyError(f"fluence column not found, available: {col_names}")
+                raise KeyError(f"未找到 fluence 列，可用列: {col_names}")
             vF = np.array(data[fluence_key], dtype=float)
 
             # === width ===
             width_key = next((k for k in ['bc_width', 'width_fitb', 'width', 'Width'] if k in col_names), None)
             if width_key is None:
-                raise KeyError(f"width column not found, available: {col_names}")
+                raise KeyError(f"未找到 width 列，可用列: {col_names}")
             vW = np.array(data[width_key], dtype=float)
-            # Check header unit; fallback to median heuristic
+            # 优先读取 header 标记的单位，否则用中位数启发式判断
             hdr = hdul[1].header
             wunit = hdr.get('WUNIT', '').lower()
             if wunit == 'ms':
-                pass  # already in ms
+                pass  # 已经是毫秒，无需转换
             else:
                 med_w = np.nanmedian(vW)
                 if np.isfinite(med_w) and med_w < 1.0:
                     vW = vW * 1000.0
 
-            # === DM_obs ===
+            # === DM_obs（观测 DM） ===
             dm_key = next((k for k in ['dm_obs', 'dm_fitb', 'bonsai_dm', 'dm', 'DM'] if k in col_names), None)
             if dm_key is None:
-                raise KeyError(f"DM column not found, available: {col_names}")
+                raise KeyError(f"未找到 DM 列，可用列: {col_names}")
             vDM_obs = np.array(data[dm_key], dtype=float)
 
-            # === DM_exc_ne2001: DM - DM_MW(NE2001) ===
+            # === DM_exc_ne2001: DM - DM_MW,NE2001（河外 DM） ===
             ne2001_key = next((k for k in ['dm_exc_ne2001', 'DM_NE2001'] if k in col_names), None)
             if ne2001_key is None:
-                raise KeyError(f"NE2001 DM column not found, available: {col_names}")
+                raise KeyError(f"FITS 缺少 NE2001 河外 DM 列，可用列: {col_names}")
             vDM_ne2001 = np.array(data[ne2001_key], dtype=float)
 
-            # === DM_exc_ymw16: DM - DM_MW(YMW16) ===
+            # === DM_exc_ymw16: DM - DM_MW,YMW16（河外 DM） ===
             ymw16_key = next((k for k in ['dm_exc_ymw16', 'DM_YMW16'] if k in col_names), None)
             if ymw16_key is None:
-                raise KeyError(f"YMW16 DM column not found, available: {col_names}")
+                raise KeyError(f"FITS 缺少 YMW16 河外 DM 列，可用列: {col_names}")
             vDM_ymw16 = np.array(data[ymw16_key], dtype=float)
 
-            # === Redshift (Catalog 2 usually lacks this) ===
-            z_key = next((k for k in ['redshift', 'z', 'Z'] if k in col_names), None)
-            vz_raw = np.array(data[z_key], dtype=float) if z_key else np.full(len(vDM_obs), np.nan)
-
-            # === Survey (Catalog 2 is single CHIME survey, optional) ===
+            # === 巡天（Catalog 2 为单一 CHIME 巡天，此列可选） ===
             svy_key = next((k for k in ['survey', 'SURVEY', 'telescope'] if k in col_names), None)
             if svy_key is not None:
                 vSVY = np.array(data[svy_key])
@@ -835,32 +935,6 @@ class Loadfiles:
                 vSVY = np.array(['CHIME'] * len(vDM_obs))
 
         return vF, vW, vDM_obs, vDM_ne2001, vDM_ymw16, vSVY
-
-    def resolve_redshift(self, vDM, vDM_gal, vZ_catalog):
-        """Resolve redshift source: prefer catalog z, fallback to DM inference.
-
-        Args:
-            vDM: observed DM array
-            vDM_gal: Galactic DM contribution array
-            vZ_catalog: catalog redshift (NaN if missing)
-
-        Returns:
-            vz: unified redshift array
-        """
-        cos = Cosmology()
-        vz = np.zeros(len(vDM))
-        for i in range(len(vDM)):
-            if not np.isnan(vZ_catalog[i]):
-                vz[i] = vZ_catalog[i]
-            else:
-                dm_cosmic = vDM[i] - vDM_gal[i]
-                # Typical DM_host ~ 50 pc cm^-3 (log-normal median)
-                dm_host_typical = 50.0
-                if dm_cosmic > dm_host_typical:
-                    vz[i] = cos.GetZ(dm_cosmic, dm_host_typical)
-                else:
-                    vz[i] = 0.01  # minimum redshift fallback
-        return vz
 
 def gammainc(alpha, x):
     if alpha==0:
@@ -888,13 +962,20 @@ def chkargv(argv, key):
 def Sampling1D(x, y, x1, x2, n):
     ymax = np.max(y)
     if ymax <= 0:
-        raise ValueError("Sampling1D: target distribution is zero everywhere in sampling range")
+        raise ValueError("Sampling1D: 目标分布在采样范围内全为零，无法采样")
+    fuc = interp1d(x, y / ymax, bounds_error=False, fill_value=0.0)
     nt = 0
     res = np.array([])
-    while (nt<n):
-        fuc = interp1d(x, y / ymax, bounds_error=False, fill_value=0.0)
-        vx = np.random.uniform(x1, x2, n-nt)
-        vy = np.random.uniform(0, 1, n-nt)
+    max_iter = 10000
+    iter_cnt = 0
+    while (nt < n):
+        iter_cnt += 1
+        if iter_cnt > max_iter:
+            raise RuntimeError(
+                f"Sampling1D: 达到最大迭代次数 {max_iter}，仅采到 {nt}/{n} 个样本，"
+                f"接受率过低，请检查分布形状或采样范围")
+        vx = np.random.uniform(x1, x2, n - nt)
+        vy = np.random.uniform(0, 1, n - nt)
         res = np.append(res, vx[vy <= fuc(vx)])
         nt = len(res)
     return res
