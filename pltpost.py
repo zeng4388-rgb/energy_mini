@@ -6,9 +6,6 @@ import matplotlib as mpl
 import sys
 import json
 import argparse
-from pathlib import Path
-from mpl_toolkits.mplot3d import Axes3D
-from matplotlib.ticker import LinearLocator, FormatStrFormatter
 import pymultinest
 from frb_util import load_config
 
@@ -19,8 +16,8 @@ mpl.rcParams['xtick.labelsize']=16
 mpl.rcParams['ytick.labelsize']=16
 mpl.rcParams['axes.labelsize']=22
 
-def plot2dposterior_withconf(dat, likli, indx=[], labels=[], rate=0.5, 
-        par=np.array([]),
+def plot2dposterior_withconf(dat, likli, indx=[], labels=[], rate=0.5,
+        par=np.array([]), truth_par=None,
                     parm=np.array([]), rangedat=np.array([]), levels=[0.68],
                     bolupp=False):
     '''Plot a 2D posterier with likelihood burning curve
@@ -29,6 +26,8 @@ def plot2dposterior_withconf(dat, likli, indx=[], labels=[], rate=0.5,
     labels: the LaTex label of the given parameter
     rate: the percentage of data to plot, e.g. 0.3 means plot data from 70% to
     the end.
+    par: 后验 MAP(黑色实线)
+    truth_par: 注入真值数组(红色虚线),与 par 同长度,已在调用前完成 log10(phis) 变换
     bolupp: 是否使用 uniform prior 风格的标记（原为模块全局变量，现已参数化）
     '''
     row, col = dat.shape;
@@ -70,7 +69,9 @@ def plot2dposterior_withconf(dat, likli, indx=[], labels=[], rate=0.5,
         if bolupp:
             if len(levels)>0:
                 for ls in [0.68, 0.95]:
-                    histc, bin_edges = np.histogram(dat[:, vari], density=True, bins=100)
+                    # 复用主直方图的 n/bins,避免重复 histogram 调用导致口径不一致
+                    histc = n
+                    bin_edges = bins
                     vom=(bin_edges[:-1]+bin_edges[1:])*0.5
                     ind=np.argsort(histc)
                     ind=ind[::-1]
@@ -78,14 +79,14 @@ def plot2dposterior_withconf(dat, likli, indx=[], labels=[], rate=0.5,
                     v[0]=histc[ind[0]]
                     for i in range(1, len(ind)):
                         v[i] = v[i-1]+histc[ind[i]]
-    
+
                     v=v/float(np.sum(histc))
                     where_idx = np.where((v[:-1] < ls) & (v[1:]>=ls))[0]
                     if len(where_idx) == 0:
                         # 后验高度集中在少数 bin，累积和首轮即超过 ls，跳过此置信水平
                         continue
                     thre= histc[ind[where_idx][0]]
-    
+
                     lv=np.min(vom[histc>=thre])
                     rv=np.max(vom[histc>=thre])
                     print(vari, '-th parameter', 'sigma=', ls, 'lv=', lv, 'rv=', rv, thre)
@@ -101,14 +102,16 @@ def plot2dposterior_withconf(dat, likli, indx=[], labels=[], rate=0.5,
                     elif ls == 0.95:
                         print(rv)
                         plt.plot([rv, rv], [0, max(n)], ls='solid', color='k', linewidth=2)
-            
+
             if par.size > 0 and vari != 3:
                 plt.plot([par[vari], par[vari]], [0, max(n)], ls='solid',
-                         color='k', linewidth=2)
+                         color='k', linewidth=2, label='MAP')
         else:
             if len(levels)>0:
                 for ls in [0.68, 0.95]:
-                    histc, bin_edges = np.histogram(dat[:, vari], density=True, bins=100)
+                    # 复用主直方图的 n/bins,避免重复 histogram 调用导致口径不一致
+                    histc = n
+                    bin_edges = bins
                     vom=(bin_edges[:-1]+bin_edges[1:])*0.5
                     ind=np.argsort(histc)
                     ind=ind[::-1]
@@ -116,13 +119,13 @@ def plot2dposterior_withconf(dat, likli, indx=[], labels=[], rate=0.5,
                     v[0]=histc[ind[0]]
                     for i in range(1, len(ind)):
                         v[i] = v[i-1]+histc[ind[i]]
-    
+
                     v=v/float(np.sum(histc))
                     where_idx = np.where((v[:-1] < ls) & (v[1:]>=ls))[0]
                     if len(where_idx) == 0:
                         continue
                     thre= histc[ind[where_idx][0]]
-    
+
                     lv=np.min(vom[histc>=thre])
                     rv=np.max(vom[histc>=thre])
                     print(vari, '-th parameter', 'sigma=', ls, 'lv=', lv, 'rv=', rv, thre)
@@ -135,7 +138,11 @@ def plot2dposterior_withconf(dat, likli, indx=[], labels=[], rate=0.5,
                     print(rv-par[vari], lv-par[vari])
             if par.size > 0:
                 plt.plot([par[vari], par[vari]], [0, max(n)], ls='solid',
-                         color='k', linewidth=2)
+                         color='k', linewidth=2, label='MAP')
+
+        if truth_par is not None:
+            plt.plot([truth_par[vari], truth_par[vari]], [0, max(n)], ls='dashed',
+                     color='red', linewidth=2)
 
         if len(parm) > 0:
             for i in range(len(parm)):
@@ -217,6 +224,10 @@ if __name__ == '__main__':
     parser.add_argument('-bo', action='store_true', dest='bolout', help='Bool option: Save plot or not')
     parser.add_argument('-c', action='store', dest='config_path', type=str, default='config_mini.json',
                         help='Config file path (default: config_mini.json)')
+    parser.add_argument('-truth', action='store', dest='truth_path', type=str, default=None,
+                        help='注入真值 JSON 文件路径(原始物理单位): '
+                             'phis(线性), alpha, logEs, log_E0, mu_w, sigma_w。'
+                             '内部会对 phis 做 log10 变换以与后验链对齐。')
     args = parser.parse_args()
     fname = args.fname
     fout = args.fout
@@ -236,26 +247,43 @@ if __name__ == '__main__':
         pri['sigma_w']
     ])
 
+    # 解析注入真值文件(若有),phis 内部做 log10 变换以与 mxchain[:,0] 对齐
+    truth_par = None
+    if args.truth_path:
+        with open(args.truth_path) as tf:
+            truth_dict = json.load(tf)
+        # 接受多种 key 命名以兼容不同写法
+        phis_val = truth_dict.get('phis', truth_dict.get('phi_star', truth_dict.get('phi*')))
+        truth_par = np.array([
+            np.log10(float(phis_val)),                  # log10(phis),与 mxchain[:,0] 一致
+            float(truth_dict.get('alpha')),
+            float(truth_dict.get('logEs', truth_dict.get('log_Es'))),
+            float(truth_dict.get('logE0', truth_dict.get('log_E0'))),
+            float(truth_dict.get('mu_w', truth_dict.get('mu'))),
+            float(truth_dict.get('sigma_w', truth_dict.get('sigma')))
+        ])
+        print(f'[truth] 注入真值(已 log10 phis): {truth_par}')
+
     a = pymultinest.Analyzer(n_params = 6, outputfiles_basename=fname)
     b = a.get_equal_weighted_posterior()
-    
+
     vlik=b[:,-1]
     allres=b[:,:-1]
     mxchain = allres
     mxchain[:,0] = np.log10(mxchain[:,0])
     vpar = mxchain[np.argmax(vlik),:]
     print(vpar)
-    
+
     if bolout:
         plt.figure(figsize=(20, 16))
-        plot2dposterior_withconf(mxchain, vlik, par=vpar, indx=[], rangedat=rdat, rate=1.0, levels=[0.68, 0.95], 
+        plot2dposterior_withconf(mxchain, vlik, par=vpar, truth_par=truth_par, indx=[], rangedat=rdat, rate=1.0, levels=[0.68, 0.95],
             labels=[r'$\log\,\phi^*$', r'$\alpha$', r'$\log E^*$', r'$\log E_0$', r'$\mu_w$', r'$\sigma_w$'],
             bolupp=bolupp)
         plt.suptitle(tit)
         plt.savefig(fout)
-    
+
     else:
-        plot2dposterior_withconf(mxchain, vlik, par=vpar, indx=[], rangedat=rdat, rate=1.0, levels=[0.68, 0.95], 
+        plot2dposterior_withconf(mxchain, vlik, par=vpar, truth_par=truth_par, indx=[], rangedat=rdat, rate=1.0, levels=[0.68, 0.95],
             labels=[r'$\log\,\phi^*$', r'$\alpha$', r'$\log E^*$', r'$\log E_0$', r'$\mu_w$', r'$\sigma_w$'],
             bolupp=bolupp)
         plt.suptitle(tit)

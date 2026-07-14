@@ -1,7 +1,6 @@
 import numpy as np
 from scipy import integrate
 from scipy.interpolate import interp1d
-from scipy.optimize import fsolve
 import scipy.special as spf
 import json
 from pathlib import Path
@@ -64,7 +63,6 @@ class Cosmology:
         self.Rhoc = 1.88 * self.h0 * self.h0 * 1e-29    #The critical density of universe in gram/cm^3
         self.Nc = self.Rhoc / 1.6726e-24       #The number density of universe in Hydrogen atom, in units of 1/cm^3
         self.f_IGM = 0.83
-        self.z0 = 0.8
 
         self.vz = np.arange(-7, 6, 0.03)
         self.vz = np.power(10., self.vz)
@@ -149,36 +147,13 @@ class Cosmology:
         ld2 = ld * ld
         ener = flu * self.Jyms2CGS * dnu * self.MHz2Hz * 4 * np.pi * ld2 / np.power(1+z, 1 + ALPHA_SPEC)
         return ener
-    
-    def LuminosityDistance_to_z(self, ld):
-        """
-        converting luminosity distance to redshift
-        """
-        return self.Ld2z(ld)
-    
-    def Luminosity_Distance_dimless(self, z):
-        """
-        calculate the dimension less luminosity distance
-        z: redshifts
-        """
-        dl = (1 + z) * self.Comoving_Distance(z) / (2. * self.Cd1)
-        return dl
-    
+
     def DispersionMeasure_IGM(self, z, chi=7./8):
         """
         calculate dispersion measure of intergalactic medium by integrating redshift
         """
         return self.dmigm(z) * self.f_IGM * chi / self.Mpc2cm * 1e6
-        
-    def Luminosity_to_Flux(self, z, lum, dnu=1000):
-        """
-        calculate the flux density observed at a given luminosity
-        """
-        ld = self.Luminosity_Distance(z)
-        ld2 = ld*ld
-        flux = lum/4/np.pi/ld2/dnu/self.MHz2Hz/self.Jy2CGS
-        return flux
-    
+
     def Energy_to_Flu(self, z, ener, dnu=400.):
         """从内禀能量反推观测 fluence (Energy 的反函数)
 
@@ -188,23 +163,6 @@ class Cosmology:
         ld2 = ld*ld
         flu = ener * np.power(1+z, 1 + ALPHA_SPEC) / 4 / np.pi / ld2 / dnu / self.MHz2Hz / self.Jyms2CGS
         return flu
-
-    def DMeq(self, z, dme, dmhost):
-        """
-        The DM equation which is solved to get redshift value
-        """
-        z = np.maximum(z, 1e-7)   # fsolve 可能试探负值，保护插值器
-        dmi = self.DispersionMeasure_IGM(z)
-        dmh = dmhost/(1+z)
-        return dmi + dmh - dme
-
-    def GetZ(self, dme, dmhost):
-        """
-        solving the differential equation to get redshift
-        """
-        z = fsolve(self.DMeq, self.z0, args=(dme, dmhost))
-        z = float(z)
-        return z
 
 class Telescope:
     def __init__(self):
@@ -230,41 +188,29 @@ class AstroDistribution:
         self.Wmax = 20
         self.Wmin = 0.05
 
-    def Schechter_log(self, logl, phis, alpha, logls):
-        """
-        The Schecheter luminosity function per logarithmic luminosity
-        logl: the logarithmic luminosity
-        phis: normalization constant
-        logls: the cut-off luminosity
-        alpha: power index
-        """
-        l = np.power(10., logl)
-        ls = np.power(10., logls)
-        phi = np.log(10) * phis * np.power(l / ls, (alpha + 1)) * np.exp(-l / ls)
-        return phi
-
     def log_IntBeam(self, logl, alpha, logls, logl0):
         ratio = np.power(10., logl-logls)
         lik0 = gammainc(alpha+1, ratio) - gammainc(alpha+1, 2*ratio)
         lik = lik0/np.log(2)      # Beam efficiency from 50% to 100%
         lik = np.where(np.isfinite(lik) & (lik > 0), lik, 1e-199)
         loglik = np.log(lik)
-        loglik[logl < logl0] = -1e99
+        # 用 np.where 代替布尔索引赋值，同时支持标量和数组输入
+        loglik = np.where(logl < logl0, -1e30, loglik)
         return loglik
 
-    def IntLum(self, eps, alpha, logls, logl0):
-        with np.errstate(invalid='ignore'):
-             ratio = np.power(10., logl0-logls)
-        return gammainc(alpha+1, ratio/eps)
-
-    # --- E_iso 能量函数别名（数学形式与光度函数完全相同） ---
+    # --- E_iso 能量函数 ---
     def Schechter_E_log(self, loge, phis, alpha, logEs):
-        """Schechter 能量函数 per dex（与 Schechter_log 数学形式相同）"""
-        return self.Schechter_log(loge, phis, alpha, logEs)
+        """Schechter 能量函数 per dex"""
+        e = np.power(10., loge)
+        es = np.power(10., logEs)
+        phi = np.log(10) * phis * np.power(e / es, (alpha + 1)) * np.exp(-e / es)
+        return phi
 
     def IntE(self, eps, alpha, logEs, logE_min):
-        """Schechter 能量累积积分（与 IntLum 数学形式相同）"""
-        return self.IntLum(eps, alpha, logEs, logE_min)
+        """Schechter 能量累积积分"""
+        with np.errstate(invalid='ignore'):
+             ratio = np.power(10., logE_min-logEs)
+        return gammainc(alpha+1, ratio/eps)
 
     def log_IntBeam_E(self, loge, alpha, logEs, logE0):
         """波束卷积后的 Schechter 能量函数（与 log_IntBeam 数学形式相同）"""
@@ -279,27 +225,6 @@ class AstroDistribution:
               + vpar[3] * np.exp(-np.power((dmv - vpar[4]) / vpar[5], 2.))
         return val
 
-    def ThetaFunc(self, x):
-        """
-        Normalize the values positive
-        """
-        return 0.5 * (np.sign(x) + 1)
-            
-    def func_gaussian(self, dmv, vpar):
-        """
-        default gaussina distribution for non-galaxy case
-        """
-        dmoff = dmv - vpar[0]
-        sig = vpar[1]
-        sig = sig * sig
-        return np.exp(-0.5 * dmoff * dmoff / sig) * self.ThetaFunc(dmv)
-    
-    def func_uniform(self, dmv, vpar):
-        pdf = np.ones(dmv.shape)
-        pdf[dmv >= vpar[1]] = 0
-        pdf[dmv <= vpar[0]] = 0
-        return pdf
-    
     def Distribution_HostGalaxyDM(self, dmv0, fgalaxy_type=None, vpar=np.array([0,50])):
         """
         DM distribution functions of different type of host galaxies
@@ -309,65 +234,55 @@ class AstroDistribution:
         NE2001: the referenced galaxy electron density using NE2001 model
         YMW16: the referenced galaxyt electron density using YMW16 model
         """
-        ind = dmv0 < 0
-        if not fgalaxy_type: 
-            fgalaxy_type = self.func_gaussian
-        elif fgalaxy_type == 'ETG':
+        # 注意:每个分支必须显式 return。早期版本把 None 分支写成赋值后落入
+        # else,但 Python 的 if/elif/else 是互斥分支,命中 if 后不会再到 else,
+        # 导致默认调用隐式返回 None。现已改为每个分支独立 return。
+        if not fgalaxy_type:
+            # 默认使用 log 空间双高斯（vpar_etg），与 log_IntDMsrc 默认分支同源，
+            # 避免"默认分布用线性高斯、解析积分却假设 log 双高斯"的不一致（原 bug 4）
             dmv = dmv0.copy()
             dmv[dmv0<1e-9] = np.ones(dmv[dmv0<1e-9].shape)*1e-9
             res = self.Distribution_Local_galaxy_DM(np.log10(dmv), self.vpar_etg)
             res[dmv0<=0] = np.zeros(res[dmv0<=0].shape)
             return res
-        elif fgalaxy_type == 'LTG_NE2001':
+        if fgalaxy_type == 'ETG':
             dmv = dmv0.copy()
             dmv[dmv0<1e-9] = np.ones(dmv[dmv0<1e-9].shape)*1e-9
-            res = self.Distribution_Local_galaxy_DM(np.log10(dmv), 
+            res = self.Distribution_Local_galaxy_DM(np.log10(dmv), self.vpar_etg)
+            res[dmv0<=0] = np.zeros(res[dmv0<=0].shape)
+            return res
+        if fgalaxy_type == 'LTG_NE2001':
+            dmv = dmv0.copy()
+            dmv[dmv0<1e-9] = np.ones(dmv[dmv0<1e-9].shape)*1e-9
+            res = self.Distribution_Local_galaxy_DM(np.log10(dmv),
                     self.vpar_ltg_ne2001)
             res[dmv0<=0] = np.zeros(res[dmv0<=0].shape)
             return res
-        elif fgalaxy_type == 'LTG_YMW16':
+        if fgalaxy_type == 'LTG_YMW16':
             dmv = dmv0.copy()
             dmv[dmv0<1e-9] = np.ones(dmv[dmv0<1e-9].shape)*1e-9
-            res = self.Distribution_Local_galaxy_DM(np.log10(dmv), 
+            res = self.Distribution_Local_galaxy_DM(np.log10(dmv),
                     self.vpar_ltg_ymw16)
             res[dmv0<=0] = np.zeros(res[dmv0<=0].shape)
             return res
-        elif fgalaxy_type == 'ALG_NE2001':
+        if fgalaxy_type == 'ALG_NE2001':
             dmv = dmv0.copy()
             dmv[dmv0<1e-9] = np.ones(dmv[dmv0<1e-9].shape)*1e-9
             res = self.Distribution_Local_galaxy_DM(np.log10(dmv), self.vpar_alg_ne2001)
             res[dmv0<=0] = np.zeros(res[dmv0<=0].shape)
             return res
-        elif fgalaxy_type == 'ALG_YMW16':
+        if fgalaxy_type == 'ALG_YMW16':
             dmv = dmv0.copy()
             dmv[dmv0<1e-9] = np.ones(dmv[dmv0<1e-9].shape)*1e-9
             res = self.Distribution_Local_galaxy_DM(np.log10(dmv), self.vpar_alg_ymw16)
             res[dmv0<=0] = np.zeros(res[dmv0<=0].shape)
             return res
-        else:
-            if callable(fgalaxy_type):
-                return fgalaxy_type(dmv0, vpar)
-            raise ValueError(f"未识别的 fgalaxy_type: {fgalaxy_type!r}，"
-                             f"可选: ETG / LTG_NE2001 / LTG_YMW16 / ALG_NE2001 / ALG_YMW16 或自定义可调用对象")
-    
-    
-    def log_Distribution_HostGalaxyDM(self, dmv, fgalaxy_type=None, vpar=np.array([0,50])):
-        if not fgalaxy_type:
-            dmoff = dmv[dmv > 0] - vpar[0]
-            sig = vpar[1]
-            sig = sig * sig
-            res = dmv.copy()
-            res[dmv < 0] = -1e99
-            res[dmv > 0] = -0.5 * dmoff * dmoff / sig
-            return res
-        else:
-            val = self.Distribution_HostGalaxyDM(dmv, fgalaxy_type=fgalaxy_type)
-            ind=val <= 0
-            indv=val>0
-            val[indv] = np.log(val[indv])
-            val[ind] = np.ones(val[ind].shape) * -1e99
-            return val
-    
+        # 兜底:既非预定义类型也非 None,允许用户传可调用对象
+        if callable(fgalaxy_type):
+            return fgalaxy_type(dmv0, vpar)
+        raise ValueError(f"未识别的 fgalaxy_type: {fgalaxy_type!r}，"
+                         f"可选: ETG / LTG_NE2001 / LTG_YMW16 / ALG_NE2001 / ALG_YMW16 或自定义可调用对象")
+
     def SFR(self, z):
         """
         Star-forming history, the values taken from Hopkins & Beacom (2016)
@@ -413,18 +328,15 @@ class AstroDistribution:
     
     def log_Distribution_volume(self, z):
         """
-        Logarithimc differential comoving volume
+        Logarithm of differential comoving volume
+
+        对 z<0 的元素返回 -1e30（物理上禁止）。用 np.where 统一处理标量/数组/0-d 数组，
+        避免布尔索引赋值对 0-d 数组报 TypeError。
         """
-        if isinstance(z, np.ndarray):
-            ind = z<0
-            pv = np.log(self.Distribution_volume(z))
-            pv[ind] = -1e99
-            return pv
-        else:
-            if z<0:
-                return -1e99
-            else:
-                return np.log(self.Distribution_volume(z))
+        # 对 z<0 的位置用 1.0 占位计算（结果会被 np.where 丢弃），避免 log(负数) 产生 nan
+        z_safe = np.where(np.asarray(z) < 0, 1.0, z)
+        pv = np.log(self.Distribution_volume(z_safe))
+        return np.where(np.asarray(z) < 0, -1e30, pv)
 
     def IntDMsrc(self, u1, u2, vpar):
         """
@@ -451,7 +363,8 @@ class AstroDistribution:
         Logarithmic integrals of above marginalization in different galaxy type cases
         """
         if not gtype:
-            res = np.log(np.maximum(self.IntDMsrc(u1, u2, np.array([0, 50])), 1e-300))
+            # 默认使用 vpar_etg（与 Distribution_HostGalaxyDM 默认分支同源）
+            res = np.log(np.maximum(self.IntDMsrc(u1, u2, self.vpar_etg), 1e-300))
             return res
         elif gtype == 'ETG':
             res = np.log(np.maximum(self.IntDMsrc(u1, u2, self.vpar_etg), 1e-300))
@@ -469,7 +382,7 @@ class AstroDistribution:
             res = np.log(np.maximum(self.IntDMsrc(u1, u2, self.vpar_alg_ymw16), 1e-300))
             return res
         else:
-            return -1e99
+            return -1e30
            
     def dis_logw(self, logw0, mu, sigma):
         a = 1./np.sqrt(2.*np.pi*sigma*sigma)
@@ -480,28 +393,6 @@ class AstroDistribution:
         a = 2*np.pi*sigma*sigma
         b = -(logw0-mu)*(logw0-mu)/2/sigma/sigma
         return b-1/2.*np.log(a)
-
-    def log_distr_fdmwz(self, dnu, logflux, dme, logw, z, alpha, logls, logl0, mu, sigma, gtype=None):
-        """
-        Logarithmic joint distribution function of flux, DM and redshift
-        """
-        flux = np.power(10., logflux)
-        logl = np.log10(self.cos.Luminosity(z, f=flux, dnu=dnu))
-        logint1 = self.log_IntBeam(logl, alpha, logls, logl0)
-        #print logint1
-        logw0 = logw - np.log10(1+z)
-        logfw = self.log_dis_logw(logw0, mu, sigma)
-        logfz = self.log_Distribution_volume(z)
-        dmi = self.cos.DispersionMeasure_IGM(z)
-        u1 = (dme-dmi)*(1+z)*self.kappa(z)
-        u2 = ((dme-dmi)*(1+z)-self.DMsmax)*self.kappa(z)
-        #print u2
-        logint2 = np.ones(u2.shape) * (-1e99)
-        ind = u2 > 0
-        logint2[ind] = self.log_IntDMsrc(u1[ind],u2[ind],gtype=gtype)
-        #print logint2
-        loglikv = logint1 + logfz + logfw + logint2 + np.log(1+z) + np.log(self.evolution_factor(z))
-        return loglikv
 
     def log_distr_efdmwz(self, dnu, logflux, dme, logw, z, alpha, logEs, logE0, mu, sigma, gtype=None):
         """能量版联合概率 p(E_iso, DM_host | z)
@@ -516,118 +407,99 @@ class AstroDistribution:
         logint1 = self.log_IntBeam_E(loge, alpha, logEs, logE0)
         logw0 = logw - np.log10(1+z)
         logfw = self.log_dis_logw(logw0, mu, sigma)
-        logfz = self.log_Distribution_volume(z)
+        # p(z) ∝ (dV/dz) · evolution(z) / (1+z)
+        # /(1+z) 为源帧→观测帧时间膨胀因子,与 Norm1D_E / rate_2d_E / simufrb.py 采样端一致。
+        # 此处的 -log(1+z) 与下方 DM 雅可比 +log(1+z) 抵消,使净效果不含 (1+z) 因子。
+        logfz = self.log_Distribution_volume(z) - np.log(1+z)
         dmi = self.cos.DispersionMeasure_IGM(z)
         u1 = (dme-dmi)*(1+z)*self.kappa(z)
         u2 = ((dme-dmi)*(1+z)-self.DMsmax)*self.kappa(z)
-        logint2 = np.ones(u2.shape) * (-1e99)
-        ind = u2 > 0
-        logint2[ind] = self.log_IntDMsrc(u1[ind],u2[ind],gtype=gtype)
+        # u2 是 DM_host 卷积窗口下边界,物理上 host DM ≥ 0,所以 u2<0 时应截断到 0
+        # (从 0 积到 u1),而不是把整条似然清零。早期版本用 ind = u2>0 把 u2<=0 的
+        # 事件 logint2 置 -1e30,会把"残差 DM 较小、host DM 窗口被 0 截断"这类物理
+        # 上正常的事件强制赋予零似然,系统性压低似然。
+        # 真正物理上不可能的是 u1<=0(IGM DM 已超过观测 DM,即使 host DM=0 都无法解释)。
+        u2_clip = np.maximum(u2, 1e-6)   # 截断到小正数,避免 IntDMsrc 内部 log(u2) 产生 nan
+        # 用 np.where 代替布尔索引赋值，同时支持标量和数组输入
+        # 对 u1<=0 的元素用 1e-6 占位计算(结果会被 np.where 丢弃),避免传 nan 给 erf
+        u1_safe = np.where(u1 > 0, u1, 1e-6)
+        logint2_raw = self.log_IntDMsrc(u1_safe, u2_clip, gtype=gtype)
+        logint2 = np.where(u1 > 0, logint2_raw, -1e30)
+        # +log(1+z) 是 DM 变量替换雅可比 |du1/d(dme)| = (1+z)*kappa(z) 中的 (1+z) 部分;
+        # kappa(z) 已在 IntDMsrc 的卷积宽度归一化中精确抵消,无需额外补 log(kappa)。
         loglikv = logint1 + logfz + logfw + logint2 + np.log(1+z) + np.log(self.evolution_factor(z))
         return loglikv
 
-    def log_distr_fdmw(self, dnu, logflux, dme, logw, alpha, logls, logl0, mu, sigma, gtype=None):
-        """
-        Logarithmic joint distribution function of flux and DM after maginalization of redshift
-        :param dnu: intrinsic bandwidth, i.e. 1GHz
-        :param logflux: logarithmic flux
-        :param dme: dme
-        :param logls: logarithmic cut-off luminosity
-        :param alpha: lf index
-        :param logl0: minimum of lf L
-        :param fgalaxy_type: galaxy type
-        :return logarithmic likelihood:
-        """
-        #stepdms = 100/1000.
-        #vdms = np.arange(0, 100, stepdm)
-        stepz = (np.log(self.Zmax) - np.log(self.Zmin)) / 100.
-        vz = np.exp(np.arange(np.log(self.Zmin), np.log(self.Zmax), stepz))
-        lik = 0
-        for z in vz:
-            likv = np.exp(self.log_distr_fdmwz(dnu, logflux, dme, logw, z, alpha, logls, logl0, mu, sigma, gtype=gtype))
-            lik += z * stepz * likv
-        ind = lik > 0
-        ind2 = lik <= 0
-        loglik = lik.copy()
-        loglik[ind] = np.log(lik[ind])
-        loglik[ind2] = np.ones(loglik[ind2].shape) * -1e99
-        return loglik
-
     def log_distr_efdmw(self, dnu, logflux, dme, logw, alpha, logEs, logE0, mu, sigma, gtype=None):
-        """能量版联合概率，对红移 z 边际化
+        """能量版联合概率，对红移 z 边际化（完全向量化）
 
         对于有红移的事件，可直接使用 log_distr_efdmwz；本函数用于仅有 DM 的事件。
+        一次性传入整个 vz 数组，消除 Python z 循环。
+        log_distr_efdmwz 内部全部支持广播: z(nz,) × event(N,) → (nz, N)
         """
-        stepz = (np.log(self.Zmax) - np.log(self.Zmin)) / 100.
-        vz = np.exp(np.arange(np.log(self.Zmin), np.log(self.Zmax), stepz))
-        lik = 0
-        for z in vz:
-            likv = np.exp(self.log_distr_efdmwz(dnu, logflux, dme, logw, z, alpha, logEs, logE0, mu, sigma, gtype=gtype))
-            lik += z * stepz * likv
+        # z 网格 400 (向量化后 z 循环已消除, 加大 z 仅增 ~50ms, 性价比高)
+        # Norm1D_E/rate_2d_E 的 z 网格保持 200 (gammainc 瓶颈), 但事件似然的
+        # z 边际化可以更精细, 不受 gammainc 限制
+        nz = 400
+        stepz = (np.log(self.Zmax) - np.log(self.Zmin)) / nz
+        vz = np.exp(np.arange(np.log(self.Zmin), np.log(self.Zmax), stepz))  # (nz,)
+
+        # 统一转为至少 1D, 保证 likv 是 (nz, N)
+        scalar_input = np.isscalar(logflux)
+        logflux_a = np.atleast_1d(logflux)
+        dme_a = np.atleast_1d(dme)
+        logw_a = np.atleast_1d(logw)
+
+        # 一次性广播: z 升维为 (nz,1), 事件参数 (N,) → likv (nz, N)
+        # log_distr_efdmwz 内部全部支持广播: Energy(z(nz,1), flu(N,)) → (nz, N)
+        likv = np.exp(self.log_distr_efdmwz(dnu, logflux_a, dme_a, logw_a, vz[:, np.newaxis],
+                                            alpha, logEs, logE0, mu, sigma, gtype=gtype))
+        # 对 z 求和: (nz, N) → (N,)
+        lik = np.sum(vz[:, np.newaxis] * stepz * likv, axis=0)
+
         ind = lik > 0
         ind2 = lik <= 0
         loglik = lik.copy()
         loglik[ind] = np.log(lik[ind])
-        loglik[ind2] = np.ones(loglik[ind2].shape) * -1e99
+        loglik[ind2] = np.ones(loglik[ind2].shape) * -1e30
+        if scalar_input:
+            return loglik[0]
         return loglik
-    
-    def Norm1D(self, sn0, bw, npol, g, tsys, dnu, alpha, logls, logl0, mu, sigma):
-        """Normalization factor for dimensionless likelihood
-
-        注意：此为光度函数版归一化（死代码，当前 mini 管线无调用）。
-        若未来启用，需同步 C1 修复：在 fz 中补 / (1+z) 时间膨胀因子。
-        """
-        stepz = (np.log(self.Zmax) - np.log(self.Zmin)) / 100.
-        vz = np.exp(np.arange(np.log(self.Zmin), np.log(self.Zmax), stepz))
-        stepeps = (1-0.5) / 50.
-        veps = np.arange(0.5, 1, stepeps)
-        steplogw = (np.log10(self.Wmax) - np.log10(self.Wmin)) / 100.
-        vlogw = np.arange(np.log10(self.Wmin), np.log10(self.Wmax), steplogw)
-        nf = 0
-        for z in vz:
-            vw = np.power(10, vlogw)*(1+z)
-            ft = self.tel.RMEq(sn0, g, tsys, npol, bw, vw)
-            lt = self.cos.Luminosity(z, ft, dnu)
-            loglt = np.log10(lt)
-            ind = loglt < logl0
-            loglt[ind] = logl0
-            int_eps = np.zeros(loglt.shape)
-            for i in np.arange(len(loglt)):
-                int_eps[i] = np.sum(self.IntLum(veps, alpha, logls, loglt[i]*np.ones(veps.shape))/veps/np.log(2)*stepeps)
-            int_w = np.sum(int_eps*self.dis_logw(vlogw, mu, sigma)*steplogw)
-            fz = self.Distribution_volume(z) * self.evolution_factor(z)
-            nf += z*stepz*fz*int_w
-        if nf <= 0:
-            nf = 1e-199
-        return nf
 
     def Norm1D_E(self, sn0, bw, npol, g, tsys, dnu, alpha, logEs, logE0, mu, sigma):
-        """能量版归一化因子
+        """能量版归一化因子（完全向量化）
 
         检测阈值从 L_min 转换为 E_min：E_min = S_min * w_obs * dnu * 4π * D_L² / (1+z)
+        三维广播 (nz, nlogw, neps) 一次性计算，消除 Python z 循环。
+        内存: 200×200×100×8B = 32MB
         """
-        stepz = (np.log(self.Zmax) - np.log(self.Zmin)) / 100.
-        vz = np.exp(np.arange(np.log(self.Zmin), np.log(self.Zmax), stepz))
-        stepeps = (1-0.5) / 50.
-        veps = np.arange(0.5, 1, stepeps)
-        steplogw = (np.log10(self.Wmax) - np.log10(self.Wmin)) / 100.
-        vlogw = np.arange(np.log10(self.Wmin), np.log10(self.Wmax), steplogw)
-        nf = 0
-        for z in vz:
-            vw = np.power(10, vlogw)*(1+z)
-            ft = self.tel.RMEq(sn0, g, tsys, npol, bw, vw)
-            fw = ft * vw   # F_min = S_min * w_obs [Jy·ms]
-            et = self.cos.Energy(z, flu=fw, dnu=dnu)
-            loget = np.log10(et)
-            loget = np.where(np.isfinite(loget) & (loget >= logE0), loget, logE0)
-            int_eps = np.zeros(loget.shape)
-            for i in np.arange(len(loget)):
-                int_eps[i] = np.sum(self.IntE(veps, alpha, logEs, loget[i]*np.ones(veps.shape))/veps/np.log(2)*stepeps)
-            int_w = np.sum(int_eps*self.dis_logw(vlogw, mu, sigma)*steplogw)
-            # 期望检测数 <N> = T_obs · ∫ dz [dV/dz · R(z) / (1+z)] · ∫ dlogw φ(E_min)·p(w)·P_det
-            # /(1+z) 为源帧→观测帧时间膨胀因子，与 rate_2d_E / simufrb.py 采样端保持一致
-            fz = self.Distribution_volume(z) * self.evolution_factor(z) / (1.0 + z)
-            nf += z*stepz*fz*int_w
+        # 网格: z=200, eps=100, logw=200 (4M 元素, gammainc 约 1.4s)
+        # gammainc 是绝对瓶颈(0.34μs/元素), 向量化不改变总计算量;
+        # eps 维度对 gammainc 影响最大(广播维), 保持 100;
+        # z/logw 保持 200, 精度提升靠 log_distr_efdmw 的 z 网格加大
+        nz, neps, nlogw = 200, 100, 200
+        stepz = (np.log(self.Zmax) - np.log(self.Zmin)) / nz
+        vz = np.exp(np.arange(np.log(self.Zmin), np.log(self.Zmax), stepz))      # (nz,)
+        stepeps = (1-0.5) / neps
+        veps = np.arange(0.5, 1, stepeps)                                         # (neps,)
+        steplogw = (np.log10(self.Wmax) - np.log10(self.Wmin)) / nlogw
+        vlogw = np.arange(np.log10(self.Wmin), np.log10(self.Wmax), steplogw)     # (nlogw,)
+
+        # 三维广播: z(nz,1,1) × vlogw(1,nlogw,1) × veps(neps,)
+        z3d = vz[:, np.newaxis, np.newaxis]                                       # (nz,1,1)
+        vw = np.power(10, vlogw)[np.newaxis, :, np.newaxis] * (1 + z3d)           # (nz,nlogw,1)
+        ft = self.tel.RMEq(sn0, g, tsys, npol, bw, vw)                            # (nz,nlogw,1)
+        fw = ft * vw                                                              # (nz,nlogw,1)
+        et = self.cos.Energy(z3d, flu=fw, dnu=dnu)                                # (nz,nlogw,1)
+        loget = np.log10(et)
+        loget = np.where(np.isfinite(loget) & (loget >= logE0), loget, logE0)
+        # IntE: veps(neps,) × loget(nz,nlogw,1) → (nz,nlogw,neps)
+        int_eps_grid = self.IntE(veps, alpha, logEs, loget)                       # (nz,nlogw,neps)
+        int_eps = np.sum(int_eps_grid / veps[np.newaxis, np.newaxis, :] / np.log(2) * stepeps, axis=2)  # (nz,nlogw)
+        int_w = np.sum(int_eps * self.dis_logw(vlogw, mu, sigma)[np.newaxis, :] * steplogw, axis=1)     # (nz,)
+        # /(1+z) 为源帧→观测帧时间膨胀因子，与 rate_2d_E / simufrb.py 采样端一致
+        fz = self.Distribution_volume(vz) * self.evolution_factor(vz) / (1.0 + vz)  # (nz,)
+        nf = np.sum(vz * stepz * fz * int_w)
         if nf <= 0:
             nf = 1e-199
         return nf
@@ -645,56 +517,37 @@ class EventRate:
         self.yr2hr = 365*24.
         self.rad2deg2 = 3282.806350011744
         self.Gpc2Mpc = 1e3
- 
-    def rate_2d(self, sn0, bw, npol, g, tsys, dnu, phis, alpha, logls, logl0, mu, sigma):
-        stepz = (np.log(self.ad.Zmax) - np.log(self.ad.Zmin)) / 100.
-        vz = np.exp(np.arange(np.log(self.ad.Zmin), np.log(self.ad.Zmax), stepz))
-        stepeps = (1-0.5)/ 50.
-        veps = np.arange(0.5, 1, stepeps)
-        steplogw = (np.log10(self.ad.Wmax) - np.log10(self.ad.Wmin)) / 100.
-        vlogw = np.arange(np.log10(self.ad.Wmin), np.log10(self.ad.Wmax), steplogw)
-        rho = 0
-        for z in vz:
-            vw = np.power(10, vlogw)*(1+z)
-            ft = self.tel.RMEq(sn0, g, tsys, npol, bw, vw)
-            lt = self.cos.Luminosity(z, ft, dnu)
-            loglt = np.log10(lt)
-            ind = loglt < logl0
-            loglt[ind] = logl0
-            int_eps = np.zeros(loglt.shape)
-            for i in range(len(loglt)):
-                int_eps[i] = np.sum(phis*self.ad.IntLum(veps, alpha, logls, loglt[i]*np.ones(veps.shape))/veps/np.log(2)*stepeps)
-            int_w = np.sum(int_eps*self.ad.dis_logw(vlogw, mu, sigma)*steplogw)
-            fz = self.cos.dVdOdz(z)/(1+z) * self.ad.evolution_factor(z)
-            rho += z*stepz*fz*int_w
-        rho_deg = rho/self.rad2deg2/self.yr2hr
-        return rho_deg
 
     def rate_2d_E(self, sn0, bw, npol, g, tsys, dnu, phis, alpha, logEs, logE0, mu, sigma):
-        """能量版事件率密度 rho_deg [deg^-2 hr^-1]
+        """能量版事件率密度 rho_deg [deg^-2 hr^-1]（完全向量化）
 
         检测阈值从 L_min 转换为 E_min：E_min = S_min * w_obs * dnu * 4π * D_L² / (1+z)
+        三维广播 (nz, nlogw, neps) 一次性计算，消除 Python z 循环。
+        与 Norm1D_E 结构同构，仅 fz 用 dVdOdz 且多乘 phis。
         """
-        stepz = (np.log(self.ad.Zmax) - np.log(self.ad.Zmin)) / 100.
-        vz = np.exp(np.arange(np.log(self.ad.Zmin), np.log(self.ad.Zmax), stepz))
-        stepeps = (1-0.5)/ 50.
-        veps = np.arange(0.5, 1, stepeps)
-        steplogw = (np.log10(self.ad.Wmax) - np.log10(self.ad.Wmin)) / 100.
-        vlogw = np.arange(np.log10(self.ad.Wmin), np.log10(self.ad.Wmax), steplogw)
-        rho = 0
-        for z in vz:
-            vw = np.power(10, vlogw)*(1+z)
-            ft = self.tel.RMEq(sn0, g, tsys, npol, bw, vw)
-            fw = ft * vw   # F_min = S_min * w_obs [Jy·ms]
-            et = self.cos.Energy(z, flu=fw, dnu=dnu)
-            loget = np.log10(et)
-            loget = np.where(np.isfinite(loget) & (loget >= logE0), loget, logE0)
-            int_eps = np.zeros(loget.shape)
-            for i in range(len(loget)):
-                int_eps[i] = np.sum(phis*self.ad.IntE(veps, alpha, logEs, loget[i]*np.ones(veps.shape))/veps/np.log(2)*stepeps)
-            int_w = np.sum(int_eps*self.ad.dis_logw(vlogw, mu, sigma)*steplogw)
-            fz = self.cos.dVdOdz(z)/(1+z) * self.ad.evolution_factor(z)
-            rho += z*stepz*fz*int_w
+        # 网格: z=200, eps=100, logw=200 (与 Norm1D_E 一致)
+        nz, neps, nlogw = 200, 100, 200
+        stepz = (np.log(self.ad.Zmax) - np.log(self.ad.Zmin)) / nz
+        vz = np.exp(np.arange(np.log(self.ad.Zmin), np.log(self.ad.Zmax), stepz))  # (nz,)
+        stepeps = (1-0.5) / neps
+        veps = np.arange(0.5, 1, stepeps)                                           # (neps,)
+        steplogw = (np.log10(self.ad.Wmax) - np.log10(self.ad.Wmin)) / nlogw
+        vlogw = np.arange(np.log10(self.ad.Wmin), np.log10(self.ad.Wmax), steplogw) # (nlogw,)
+
+        # 三维广播: z(nz,1,1) × vlogw(1,nlogw,1) × veps(neps,)
+        z3d = vz[:, np.newaxis, np.newaxis]                                         # (nz,1,1)
+        vw = np.power(10, vlogw)[np.newaxis, :, np.newaxis] * (1 + z3d)             # (nz,nlogw,1)
+        ft = self.tel.RMEq(sn0, g, tsys, npol, bw, vw)                              # (nz,nlogw,1)
+        fw = ft * vw                                                                # (nz,nlogw,1)
+        et = self.cos.Energy(z3d, flu=fw, dnu=dnu)                                  # (nz,nlogw,1)
+        loget = np.log10(et)
+        loget = np.where(np.isfinite(loget) & (loget >= logE0), loget, logE0)
+        # IntE: veps(neps,) × loget(nz,nlogw,1) → (nz,nlogw,neps)
+        int_eps_grid = phis * self.ad.IntE(veps, alpha, logEs, loget)               # (nz,nlogw,neps)
+        int_eps = np.sum(int_eps_grid / veps[np.newaxis, np.newaxis, :] / np.log(2) * stepeps, axis=2)  # (nz,nlogw)
+        int_w = np.sum(int_eps * self.ad.dis_logw(vlogw, mu, sigma)[np.newaxis, :] * steplogw, axis=1)   # (nz,)
+        fz = self.cos.dVdOdz(vz)/(1+vz) * self.ad.evolution_factor(vz)              # (nz,)
+        rho = np.sum(vz * stepz * fz * int_w)
         rho_deg = rho/self.rad2deg2/self.yr2hr
         return rho_deg
 
@@ -704,77 +557,6 @@ class EventRate:
         lamda[ind] = 1e-199
         loglik = N*np.log(lamda)-lamda-spf.gammaln(N+1)
         return loglik
-
-    def Sens(self, sn0, g, tsys, npol, bw, mu, sigma):
-        stepz = (np.log(self.ad.Zmax) - np.log(self.ad.Zmin)) / 100.
-        vz = np.exp(np.arange(np.log(self.ad.Zmin), np.log(self.ad.Zmax), stepz))
-        steplogw = (np.log10(self.ad.Wmax) - np.log10(self.ad.Wmin)) / 100.
-        vlogw = np.arange(np.log10(self.ad.Wmin), np.log10(self.ad.Wmax), steplogw)
-        ints0 = 0
-        intz = 0
-        for z in vz:
-            vw = np.power(10, vlogw)*(1+z)
-            ft = self.tel.RMEq(sn0, g, tsys, npol, bw, vw)
-            ints0 += z*stepz*np.sum(ft*self.ad.dis_logw(vlogw, mu, sigma)*steplogw)
-            intz += z*stepz
-        smin = ints0/intz
-        return smin
-
-    def Rate(self, logft, dnu, phis, alpha, logls, logl0, mu, sigma):
-        stepz = (np.log(self.ad.Zmax) - np.log(self.ad.Zmin)) / 100.
-        vz = np.exp(np.arange(np.log(self.ad.Zmin), np.log(self.ad.Zmax), stepz))
-        stepeps = (1-0.5) / 50.
-        veps = np.arange(0.5, 1, stepeps)
-        steplogw = (np.log10(self.ad.Wmax) - np.log10(self.ad.Wmin)) / 100.
-        vlogw = np.arange(np.log10(self.ad.Wmin), np.log10(self.ad.Wmax), steplogw)
-        rho = 0
-        for z in vz:
-            vw = np.power(10, vlogw)*(1+z)
-            ft = np.power(10, logft)
-            lt = self.cos.Luminosity(z, ft, dnu)
-            loglt = np.log10(lt)
-            #ind = loglt < logl0
-            #loglt[ind] = logl0
-            if loglt < logl0:
-                loglt = logl0
-            int_eps = np.sum(phis*self.ad.IntLum(veps, alpha, logls, loglt*np.ones(veps.shape))/veps/np.log(2)*stepeps)
-            int_w = np.sum(int_eps*self.ad.dis_logw(vlogw, mu, sigma)*steplogw)
-            fz = self.cos.dVdOdz(z)/(1+z)
-            rho += z*stepz*fz*int_w
-        rho_deg = rho/self.rad2deg2/self.yr2hr
-        return rho_deg
-
-    def Rate_E(self, logft, dnu, phis, alpha, logEs, logE0, mu, sigma):
-        """能量版事件率（对单一 flux 阈值）"""
-        stepz = (np.log(self.ad.Zmax) - np.log(self.ad.Zmin)) / 100.
-        vz = np.exp(np.arange(np.log(self.ad.Zmin), np.log(self.ad.Zmax), stepz))
-        stepeps = (1-0.5) / 50.
-        veps = np.arange(0.5, 1, stepeps)
-        steplogw = (np.log10(self.ad.Wmax) - np.log10(self.ad.Wmin)) / 100.
-        vlogw = np.arange(np.log10(self.ad.Wmin), np.log10(self.ad.Wmax), steplogw)
-        rho = 0
-        for z in vz:
-            vw = np.power(10, vlogw)*(1+z)
-            ft = np.power(10, logft)
-            fw = ft * vw   # fluence = flux * width [Jy·ms]
-            et = self.cos.Energy(z, flu=fw, dnu=dnu)
-            loget = np.log10(et)
-            loget = np.where(np.isfinite(loget) & (loget >= logE0), loget, logE0)
-            int_eps = np.sum(phis*self.ad.IntE(veps, alpha, logEs, loget*np.ones(veps.shape))/veps/np.log(2)*stepeps)
-            int_w = np.sum(int_eps*self.ad.dis_logw(vlogw, mu, sigma)*steplogw)
-            fz = self.cos.dVdOdz(z)/(1+z)
-            rho += z*stepz*fz*int_w
-        rho_deg = rho/self.rad2deg2/self.yr2hr
-        return rho_deg
-
-    def Rfrb(self, phis, alpha, logls, loglmin):
-        ratio = np.power(10., loglmin-logls)
-        return phis*gammainc(alpha+1, ratio)
-
-    def Rfrb_E(self, phis, alpha, logEs, logEmin):
-        """能量版事件率（对单一能量阈值）"""
-        ratio = np.power(10., logEmin-logEs)
-        return phis*gammainc(alpha+1, ratio)   
 
 class Loadfiles:
     #def __init__(self):
@@ -981,18 +763,30 @@ def Sampling1D(x, y, x1, x2, n):
     return res
 
 def SamplingND(fuc, par_range, maxv_ori, n):
+    """拒绝采样 N 维分布。
+
+    与 Sampling1D 类似，maxv 会在发现更高峰值时上调并重置已采样本。
+    加 max_iter 防止极端分布（尖峰）下反复重置导致死循环。
+    """
     nt = 0
     maxv = maxv_ori
     res = np.array([])
     npar, m = par_range.shape
     res = res.reshape((0, npar))
+    max_iter = 10000
+    iter_cnt = 0
     while (nt < n):
+        iter_cnt += 1
+        if iter_cnt > max_iter:
+            raise RuntimeError(
+                f"SamplingND: 达到最大迭代次数 {max_iter}，仅采到 {nt}/{n} 个样本，"
+                f"接受率过低，请检查分布形状或采样范围")
         vpar = np.random.uniform(0, 1, (n-nt, npar))
         for i in range(npar):
             lv = par_range[i,0]
             rv = par_range[i,1]
             vpar[:,i] = vpar[:,i] * (rv-lv) + lv
-        
+
         vy = np.random.uniform(0, 1, n-nt)*maxv
         fv = fuc(vpar)
         if (np.max(fv) > maxv):

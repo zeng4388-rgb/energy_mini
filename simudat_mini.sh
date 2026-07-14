@@ -1,7 +1,8 @@
 #!/bin/sh
+set -e
 
-# FRB number (缩减: 100 -> 20)
-Nfrb=20
+# FRB number (加大: 20 -> 300, 提升推断样本量)
+Nfrb=300
 
 # E_iso energy function parameters
 alpha=-1.5
@@ -27,7 +28,7 @@ fov=200
 galaxy_type=ALG_YMW16
 
 # 创建输出目录
-mkdir -p simu_mini
+mkdir -p simu_mini nest_out_mini/simu
 
 # 缩减: 只跑 phis=1e3 一组
 for phis in 1e3
@@ -35,6 +36,13 @@ do
     outputfile=./simu_mini/simdat_${phis}_${fov}.txt
     echo "python3 simufrb.py -ns $Nfrb -phis $phis -alpha $alpha -logEs $logEs -logE0 $logE0 -dnu $dnu -fgt $galaxy_type -mu ${mu} -sig ${sigma} -ga $g -npol $np -bw $bw -ts $Ts -sn0 $sn0 -fov $fov -out $outputfile --config config_mini.json"
     python3 simufrb.py -ns $Nfrb -phis $phis -alpha $alpha -logEs $logEs -logE0 $logE0 -dnu $dnu -fgt $galaxy_type -mu ${mu} -sig ${sigma} -ga $g -npol $np -bw $bw -ts $Ts -sn0 $sn0 -fov $fov -out $outputfile --config config_mini.json
+
+    # 写入注入真值(原始物理单位),供 pltpost.py 画 truth 竖线
+    # 路径与 pltpost.py 的 -f 参数(./nest_out_mini/simu/simdat_${phis})绑定
+    truth_file=./nest_out_mini/simu/simdat_${phis}.truth.json
+    cat > $truth_file <<EOF
+{"phis": ${phis}, "alpha": ${alpha}, "logEs": ${logEs}, "logE0": ${logE0}, "mu_w": ${mu}, "sigma_w": ${sigma}}
+EOF
+    echo "[truth] 注入真值写入 $truth_file"
 done
-wait
 exit

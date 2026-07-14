@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 
 import numpy as np
-from scipy import interpolate
 import time
 import pymultinest
 import warnings
@@ -45,10 +44,16 @@ def lnlik(vpar):
         import traceback
         print('Numerical error: @', vpar)
         traceback.print_exc()
-        return -1e99
+        return -1e30
 
 def myprior(cube, ndim, nparams):
-    """从 config 读取先验范围（能量参数）"""
+    """从 config 读取先验范围（能量参数）
+
+    注意:参数顺序 [phis, alpha, log_Es, log_E0, mu_w, sigma_w] 在多处硬编码依赖:
+    - pltpost.py 第 97/109 行的 vari != 3 把 log_E0 特殊处理(只画 95% 上限)
+    - pltpost.py 第 245-252 行的 rangedat 顺序
+    改顺序要同步改那些地方。
+    """
     cfg = config['prior']
     cube[0] = 10.0 ** (cfg['log_phis'][0] + cube[0] * (cfg['log_phis'][1] - cfg['log_phis'][0]))
     cube[1] = cfg['alpha'][0] + cube[1] * (cfg['alpha'][1] - cfg['alpha'][0])
@@ -112,9 +117,12 @@ if __name__ == '__main__':
     vdT = cat['T']
     vN = np.array([len(vLOGFLUX)])
     vFOV = np.array([fov])
-    # 优先用 header 中的 T_obs（模拟器写入的固定观测时长）
-    # 回退到 sum(vdT) 兼容无 T_obs 的旧文件（注意：旧文件存在 N19 漏末段时间的偏差）
-    vT = np.array([cat.get('T_obs', np.sum(vdT))])
+    # 模拟数据的观测时长必须用 sum(vT)：模拟器固定生成 ns 个事件，
+    # 到达时间 vT ~ exponential(1/λ)，实际总时长 = sum(vT) ≈ ns/λ。
+    # header 中的 T_obs 是 tel_svy.txt 的巡天时长（如 CHIME 26280 hr），
+    # 不是模拟数据的实际时长。若用 T_obs 会导致泊松似然把 phis 偏离真值
+    # 约 T_obs/sum(vT) 倍（可达 3+ 个量级），truth 线飞出 posterior 范围。
+    vT = np.array([np.sum(vdT)])
 
     # 先验范围（从 config 读取）
     cfg = config['prior']
@@ -123,10 +131,9 @@ if __name__ == '__main__':
     vparb = np.array([cfg['log_phis'][1], cfg['alpha'][1], cfg['log_Es'][1],
                       cfg['log_E0'][1], cfg['mu_w'][1], cfg['sigma_w'][1]])
 
-    vpar_range = np.dstack((vpara.transpose(), vparb.transpose()))[0, :, :]
-
     print('------------par range-----------')
-    print(vpar_range)
+    print('lower:', vpara)
+    print('upper:', vparb)
     print(f'CHIME params: g={g}, bw={bw}, tsys={tsys}, fov={fov}, dnu={dnu}')
     a1 = time.perf_counter()
     # sanity check：通过 myprior 变换后再求似然（vpara[0] 是 log_phis，不能直送 lnlik）
@@ -144,5 +151,5 @@ if __name__ == '__main__':
                     resume=False,
                     verbose=True,
                     sampling_efficiency='model',
-                    n_live_points=200,
+                    n_live_points=500,
                     outputfiles_basename=config['output']['nest_out_dir'] + 'simu/' + fout)

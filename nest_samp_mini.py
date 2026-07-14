@@ -2,7 +2,6 @@
 
 import numpy as np
 from collections import Counter
-from scipy import interpolate
 import time
 import pymultinest
 import warnings
@@ -51,13 +50,18 @@ def lnlik(vpar):
         import traceback
         print('Numerical error: @', vpar)
         traceback.print_exc()
-        return -1e99
+        return -1e30
 
 def myprior(cube, ndim, nparams):
     """从 config.json 读取先验范围（能量参数）
 
     cube[0] 输出 linear phis（下游 rate_2d_E 需要线性值）
     cube[2], cube[3] 输出 log10(E*), log10(E0)
+
+    注意:参数顺序 [phis, alpha, log_Es, log_E0, mu_w, sigma_w] 在多处硬编码依赖:
+    - pltpost.py 第 97/109 行的 vari != 3 把 log_E0 特殊处理(只画 95% 上限)
+    - pltpost.py 第 245-252 行的 rangedat 顺序
+    改顺序要同步改那些地方。
     """
     cfg = config['prior']
     cube[0] = 10.0 ** (cfg['log_phis'][0] + cube[0] * (cfg['log_phis'][1] - cfg['log_phis'][0]))
@@ -178,10 +182,9 @@ if __name__ == '__main__':
     vparb = np.array([cfg['log_phis'][1], cfg['alpha'][1], cfg['log_Es'][1],
                       cfg['log_E0'][1], cfg['mu_w'][1], cfg['sigma_w'][1]])
 
-    vpar_range = np.dstack((vpara.transpose(), vparb.transpose()))[0, :, :]
-
     print('------------par range-----------')
-    print(vpar_range)
+    print('lower:', vpara)
+    print('upper:', vparb)
     a1 = time.perf_counter()
     # sanity check：通过 myprior 变换后再求似然（vpara[0] 是 log_phis，不能直送 lnlik）
     cube_test = np.zeros(len(vpara))
@@ -199,5 +202,5 @@ if __name__ == '__main__':
                     resume=False,
                     verbose=True,
                     sampling_efficiency='model',
-                    n_live_points=200,
+                    n_live_points=500,
                     outputfiles_basename=config['output']['nest_out_dir'] + 'samp/' + fout)

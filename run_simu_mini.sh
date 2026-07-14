@@ -1,3 +1,7 @@
+#!/bin/sh
+# 模拟数据嵌套采样(单任务)
+
+set -e
 export OMP_NUM_THREADS=1
 
 fov=200

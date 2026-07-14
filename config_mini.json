@@ -13,12 +13,12 @@
     "Omega_L": 0.692
   },
   "prior": {
-    "log_phis": [-6.0, 6.0],
-    "alpha": [-4.0, 2.0],
+    "log_phis": [0.0, 5.0],
+    "alpha": [-4.0, 0.0],
     "log_Es": [39.0, 44.0],
-    "log_E0": [37.0, 41.0],
+    "log_E0": [34.0, 40.0],
     "mu_w": [-1.0, 2.0],
-    "sigma_w": [0.1, 1.0]
+    "sigma_w": [0.0001, 1.0]
   },
   "output": {
     "nest_out_dir": "nest_out_mini/",
