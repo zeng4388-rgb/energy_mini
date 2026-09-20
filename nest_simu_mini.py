@@ -79,6 +79,7 @@ if __name__ == '__main__':
     parser.add_argument('--config', action='store', dest='config_path', type=str,
                         default='config_mini.json', help='Path to config file')
     args = parser.parse_args()
+    t_total0 = time.perf_counter()
     simu1 = args.simu1
     fout = args.fout
     fgt = args.fgt
@@ -151,5 +152,7 @@ if __name__ == '__main__':
                     resume=False,
                     verbose=True,
                     sampling_efficiency='model',
-                    n_live_points=500,
+                    n_live_points=1000,
                     outputfiles_basename=config['output']['nest_out_dir'] + 'simu/' + fout)
+    print(f"[simu] MultiNest 总耗时 {time.perf_counter()-t_total0:.1f}s "
+          f"({(time.perf_counter()-t_total0)/60:.1f} min)")

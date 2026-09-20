@@ -5,7 +5,8 @@
   },
   "analysis": {
     "halo_dm": 30.0,
-    "dnu": 400.0
+    "dnu": 400.0,
+    "mwprop_dist_kpc": 100.0
   },
   "cosmology": {
     "H0": 67.8,
@@ -16,9 +17,9 @@
     "log_phis": [0.0, 5.0],
     "alpha": [-4.0, 0.0],
     "log_Es": [39.0, 44.0],
-    "log_E0": [34.0, 40.0],
+    "log_E0": [33.0, 40.0],
     "mu_w": [-1.0, 2.0],
-    "sigma_w": [0.0001, 1.0]
+    "sigma_w": [0.01, 1.0]
   },
   "output": {
     "nest_out_dir": "nest_out_mini/",

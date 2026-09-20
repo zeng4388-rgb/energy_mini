@@ -1,7 +1,14 @@
 #!/bin/sh
 set -e
 
-# FRB number (加大: 20 -> 300, 提升推断样本量)
+# 脚本级计时
+T_START=$(date +%s)
+fmt_time() {
+    s=$1
+    printf "%dm %ds" $((s / 60)) $((s % 60))
+}
+
+# FRB number (下调: 1000 -> 300)
 Nfrb=300
 
 # E_iso energy function parameters
@@ -45,4 +52,6 @@ do
 EOF
     echo "[truth] 注入真值写入 $truth_file"
 done
+
+echo "[simudat_mini.sh 完成, 耗时 $(fmt_time $(( $(date +%s) - T_START )))]"
 exit

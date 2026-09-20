@@ -164,8 +164,8 @@ def plot2dposterior_withconf(dat, likli, indx=[], labels=[], rate=0.5,
             liklisub = likli[ind]
             x = dat[ind, varj]
             y = dat[ind, vari]
-            ngridx = 20
-            ngridy = 30
+            ngridx = 60
+            ngridy = 60
             #generate 2D histogram
             H, xedges, yedges = np.histogram2d(x, y, bins=(ngridx, ngridy),
                                                range=(rangedat[varj, :], rangedat[vari, :]))

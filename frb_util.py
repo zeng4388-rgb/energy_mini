@@ -114,30 +114,19 @@ class Cosmology:
     
     def Luminosity_Distance(self, z):
         """
-        calculate the luminosity distance in Mpc
+        calculate the luminosity distance in cm
+        (注意: 返回单位是 cm, 不是 Mpc)
         z: redshifts
         """
         dl = (1 + z) * self.Comoving_Distance(z)
         return dl
 
-    def Luminosity(self, z, f=1., dnu=1000.):
-        """
-        calculate the intrinsic luminosity from flux
-        f: flux in unit of Jy
-        dnu: intrinsic spectral width
-        z: redshifts
-        """
-        ld = self.Luminosity_Distance(z)
-        ld2 = ld * ld
-        lum = f * self.Jy2CGS * dnu * self.MHz2Hz * 4 * np.pi * ld2
-        return lum
-
     def Energy(self, z, flu=1.0, dnu=400.):
-        """计算内禀能量 E_iso
+        """计算各向同性能量 E_iso (Lin et al. 2024, ApJ 962, 73, Eq.7)
 
-        公式: E = 4π D_L² · Δν_obs · F / (1+z)^(1+α)
-        其中 α = -1.39 (FRB 谱指数, Shin 2023)
-        等价于: E = 4π D_L² · Δν_em · F / (1+z)^(2+α)
+        公式: E = 4π D_L² · Δν_obs · F / (1+z)^(2+α)
+        其中谱指数 α = -1.39 (Shin 2023)，即分母 (1+z)^0.61
+        Δν_obs 为观测帧带宽（CHIME 400-800 MHz，Δν=400 MHz）
 
         flu: fluence [Jy·ms]
         dnu: 观测帧带宽 Δν_obs [MHz]
@@ -145,7 +134,7 @@ class Cosmology:
         """
         ld = self.Luminosity_Distance(z)
         ld2 = ld * ld
-        ener = flu * self.Jyms2CGS * dnu * self.MHz2Hz * 4 * np.pi * ld2 / np.power(1+z, 1 + ALPHA_SPEC)
+        ener = flu * self.Jyms2CGS * dnu * self.MHz2Hz * 4 * np.pi * ld2 / np.power(1+z, 2 + ALPHA_SPEC)
         return ener
 
     def DispersionMeasure_IGM(self, z, chi=7./8):
@@ -157,11 +146,13 @@ class Cosmology:
     def Energy_to_Flu(self, z, ener, dnu=400.):
         """从内禀能量反推观测 fluence (Energy 的反函数)
 
-        公式: F = E · (1+z)^(1+α) / (4π D_L² · Δν_obs)
+        公式: F = E · (1+z)^(2+α) / (4π D_L² · Δν_obs)
+        其中谱指数 α = -1.39 (Shin 2023)，即分子 (1+z)^0.61
+        Δν_obs 为观测帧带宽（CHIME 400-800 MHz，Δν=400 MHz）
         """
         ld = self.Luminosity_Distance(z)
         ld2 = ld*ld
-        flu = ener * np.power(1+z, 1 + ALPHA_SPEC) / 4 / np.pi / ld2 / dnu / self.MHz2Hz / self.Jyms2CGS
+        flu = ener * np.power(1+z, 2 + ALPHA_SPEC) / 4 / np.pi / ld2 / dnu / self.MHz2Hz / self.Jyms2CGS
         return flu
 
 class Telescope:
@@ -184,7 +175,11 @@ class AstroDistribution:
         self.vpar_alg_ymw16 = np.array([0.01199, 0.7597, 0.3082, 0.01735, 1.048, 0.6025])
         self.Zmax = 5
         self.Zmin = 2e-6
-        self.DMsmax = 50.
+        # MW 晕 DM 均匀分布上限 [pc/cm^3]: U[0,60] 均值 30 (Dolag et al. 2015)。
+        # 总 DM_MW = DM_MW,ISM(目录 dm_exc 逐事件, 中位 ~50) + 晕均值 30 ≈ 80
+        # (Shin 2023, ApJ 944, 105, 附录 A.2: DM_MW 固定 80, 偏差由宿主吸收;
+        #  本管线宿主为固定参数, 用均匀卷积代偿吸收)。观测帧, 不乘 (1+z)。
+        self.DMsmax = 60.
         self.Wmax = 20
         self.Wmin = 0.05
 
@@ -340,7 +335,7 @@ class AstroDistribution:
 
     def IntDMsrc(self, u1, u2, vpar):
         """
-        Analytic integral when marginalizing distribution of DMsrc
+        Analytic integral when marginalizing the uniform DM_MW,halo distribution
         """
         a1 = vpar[0]
         b1 = vpar[1]
@@ -355,7 +350,7 @@ class AstroDistribution:
         q3 = (c2*c2*np.log(10)*np.log(10)+b2*np.log(100)-2*np.log(u1))/c2/np.log(100)
         q4 = (c2*c2*np.log(10)*np.log(10)+b2*np.log(100)-2*np.log(u2))/c2/np.log(100)
         int_h = np.log(10)*np.sqrt(np.pi)/2 * (k1*(spf.erf(q2)-spf.erf(q1))+k2*(spf.erf(q4)-spf.erf(q3)))
-        int_hs = int_h/self.DMsmax   #   integral including uniform DMsrc
+        int_hs = int_h/self.DMsmax   #   integral including uniform DM_MW,halo
         return int_hs
 
     def log_IntDMsrc(self, u1, u2, gtype=None):
@@ -398,7 +393,7 @@ class AstroDistribution:
         """能量版联合概率 p(E_iso, DM_host | z)
 
         将观测流量 logflux 和脉冲宽度 logw 耦合为 E_iso，再用 Schechter 能量函数评估。
-        物理关系：E_iso = S * w * dnu * 4π * D_L² / (1+z)
+        物理关系：E_iso = S * w * dnu * 4π * D_L² / (1+z)^(2+α)，谱指数 α = -1.39 (Shin 2023)
         """
         flux = np.power(10., logflux)
         w_ms = np.power(10., logw)       # 脉冲宽度 [ms]
@@ -409,11 +404,14 @@ class AstroDistribution:
         logfw = self.log_dis_logw(logw0, mu, sigma)
         # p(z) ∝ (dV/dz) · evolution(z) / (1+z)
         # /(1+z) 为源帧→观测帧时间膨胀因子,与 Norm1D_E / rate_2d_E / simufrb.py 采样端一致。
-        # 此处的 -log(1+z) 与下方 DM 雅可比 +log(1+z) 抵消,使净效果不含 (1+z) 因子。
         logfz = self.log_Distribution_volume(z) - np.log(1+z)
         dmi = self.cos.DispersionMeasure_IGM(z)
+        # DM_MW = DM_MW,ISM + DM_MW,halo。目录 dme(dm_exc) 已扣 ISM 部分,残差
+        # r = dme - dmi = DM_MW,halo + DM_host/(1+z),其中 DM_MW,halo ~ U[0, DMsmax]
+        # 位于观测帧(z≈0),不随 (1+z) 缩放。对 δ∈[0,DMsmax] 卷积后宿主 DM 窗口为
+        # [(r-DMsmax)(1+z), r(1+z)]·κ,即 u2 先在观测帧扣 DMsmax 再乘 (1+z)。
         u1 = (dme-dmi)*(1+z)*self.kappa(z)
-        u2 = ((dme-dmi)*(1+z)-self.DMsmax)*self.kappa(z)
+        u2 = (dme-dmi-self.DMsmax)*(1+z)*self.kappa(z)
         # u2 是 DM_host 卷积窗口下边界,物理上 host DM ≥ 0,所以 u2<0 时应截断到 0
         # (从 0 积到 u1),而不是把整条似然清零。早期版本用 ind = u2>0 把 u2<=0 的
         # 事件 logint2 置 -1e30,会把"残差 DM 较小、host DM 窗口被 0 截断"这类物理
@@ -425,10 +423,22 @@ class AstroDistribution:
         u1_safe = np.where(u1 > 0, u1, 1e-6)
         logint2_raw = self.log_IntDMsrc(u1_safe, u2_clip, gtype=gtype)
         logint2 = np.where(u1 > 0, logint2_raw, -1e30)
-        # +log(1+z) 是 DM 变量替换雅可比 |du1/d(dme)| = (1+z)*kappa(z) 中的 (1+z) 部分;
-        # kappa(z) 已在 IntDMsrc 的卷积宽度归一化中精确抵消,无需额外补 log(kappa)。
-        loglikv = logint1 + logfz + logfw + logint2 + np.log(1+z) + np.log(self.evolution_factor(z))
+        # DM_MW,halo 为观测帧项:对 δ∈[0,DMsmax] 卷积时,逐点密度雅可比 (1+z) 与
+        # 卷积测度换元 dδ=-dX/(1+z) 精确抵消,净密度即 IntDMsrc(u1,u2)/DMsmax,
+        # 不再额外补 log(1+z)(旧版把均匀项放在宿主帧才需要)。
+        loglikv = logint1 + logfz + logfw + logint2 + np.log(self.evolution_factor(z))
         return loglikv
+
+    def log_distr_efdmw_grid(self, dnu, logflux, dme, logw, vz, alpha, logEs, logE0, mu, sigma, gtype=None):
+        """逐事件×逐红移对数似然网格 (nz, N)
+
+        log_distr_efdmw 的 z 边际化与 pltpz.py 的逐事件 P(z) 可视化共用此网格。
+        logflux/dme/logw 接受标量或 (N,) 数组, vz 为 (nz,) 红移网格;
+        返回未边际化的 log p(z, 事件 | 参数)，z 积分测度 ∝ vz·dz 由调用方处理。
+        """
+        return self.log_distr_efdmwz(dnu, np.atleast_1d(logflux), np.atleast_1d(dme),
+                                     np.atleast_1d(logw), np.atleast_1d(vz)[:, np.newaxis],
+                                     alpha, logEs, logE0, mu, sigma, gtype=gtype)
 
     def log_distr_efdmw(self, dnu, logflux, dme, logw, alpha, logEs, logE0, mu, sigma, gtype=None):
         """能量版联合概率，对红移 z 边际化（完全向量化）
@@ -452,8 +462,8 @@ class AstroDistribution:
 
         # 一次性广播: z 升维为 (nz,1), 事件参数 (N,) → likv (nz, N)
         # log_distr_efdmwz 内部全部支持广播: Energy(z(nz,1), flu(N,)) → (nz, N)
-        likv = np.exp(self.log_distr_efdmwz(dnu, logflux_a, dme_a, logw_a, vz[:, np.newaxis],
-                                            alpha, logEs, logE0, mu, sigma, gtype=gtype))
+        likv = np.exp(self.log_distr_efdmw_grid(dnu, logflux_a, dme_a, logw_a, vz,
+                                                alpha, logEs, logE0, mu, sigma, gtype=gtype))
         # 对 z 求和: (nz, N) → (N,)
         lik = np.sum(vz[:, np.newaxis] * stepz * likv, axis=0)
 
@@ -469,7 +479,7 @@ class AstroDistribution:
     def Norm1D_E(self, sn0, bw, npol, g, tsys, dnu, alpha, logEs, logE0, mu, sigma):
         """能量版归一化因子（完全向量化）
 
-        检测阈值从 L_min 转换为 E_min：E_min = S_min * w_obs * dnu * 4π * D_L² / (1+z)
+        检测阈值从 L_min 转换为 E_min：E_min = S_min * w_obs * dnu * 4π * D_L² / (1+z)^(2+α)，谱指数 α = -1.39 (Shin 2023)
         三维广播 (nz, nlogw, neps) 一次性计算，消除 Python z 循环。
         内存: 200×200×100×8B = 32MB
         """
@@ -521,7 +531,7 @@ class EventRate:
     def rate_2d_E(self, sn0, bw, npol, g, tsys, dnu, phis, alpha, logEs, logE0, mu, sigma):
         """能量版事件率密度 rho_deg [deg^-2 hr^-1]（完全向量化）
 
-        检测阈值从 L_min 转换为 E_min：E_min = S_min * w_obs * dnu * 4π * D_L² / (1+z)
+        检测阈值从 L_min 转换为 E_min：E_min = S_min * w_obs * dnu * 4π * D_L² / (1+z)^(2+α)，谱指数 α = -1.39 (Shin 2023)
         三维广播 (nz, nlogw, neps) 一次性计算，消除 Python z 循环。
         与 Norm1D_E 结构同构，仅 fz 用 dVdOdz 且多乘 phis。
         """
@@ -651,7 +661,8 @@ class Loadfiles:
     def LoadFitsCatalog(self, fname):
         """读取 CHIME/FRB Catalog 2 FITS 文件
 
-        返回: vF(fluence Jy·ms), vW(width ms), vDM_obs, vDM_ne2001, vDM_ymw16, vSVY
+        返回: vF(fluence Jy·ms), vW(width ms), vDM_obs, vDM_ne2001, vDM_ymw16,
+              vDM_ne2025(可选列, 缺失时为 None), vSVY
 
         CHIME Catalog 2 关键列名:
           fluence, fluence_err — fluence 及误差 [Jy ms]
@@ -709,6 +720,13 @@ class Loadfiles:
                 raise KeyError(f"FITS 缺少 YMW16 河外 DM 列，可用列: {col_names}")
             vDM_ymw16 = np.array(data[ymw16_key], dtype=float)
 
+            # === DM_exc_ne2025: 可选列, 本管线用 mwprop/NE2025 预计算, 目录不自带 ===
+            # 缺失时返回 None（回归保护: 旧 filtered.fits 不选 --mw ne2025 时行为不变）
+            ne2025_key = next((k for k in ['dm_exc_ne2025', 'DM_NE2025']
+                               if k in col_names), None)
+            vDM_ne2025 = (np.array(data[ne2025_key], dtype=float)
+                          if ne2025_key is not None else None)
+
             # === 巡天（Catalog 2 为单一 CHIME 巡天，此列可选） ===
             svy_key = next((k for k in ['survey', 'SURVEY', 'telescope'] if k in col_names), None)
             if svy_key is not None:
@@ -716,7 +734,103 @@ class Loadfiles:
             else:
                 vSVY = np.array(['CHIME'] * len(vDM_obs))
 
-        return vF, vW, vDM_obs, vDM_ne2001, vDM_ymw16, vSVY
+        return vF, vW, vDM_obs, vDM_ne2001, vDM_ymw16, vDM_ne2025, vSVY
+
+# --- mwprop/NE2025 银河系电子密度模型封装（仅数据预处理端调用） ---
+# NE2025: Ocker & Cordes 2026 (arXiv:2602.11838)，官方纯 Python 实现 mwprop
+# (pip install mwprop，依赖 numpy/matplotlib/scipy/astropy/mpmath)。
+# 用途: dm_exc_ne2025 = dm_obs - DM_MW,NE2025(gl, gb, dist_kpc)，
+# 积分距离 dist_kpc 从 config 的 analysis.mwprop_dist_kpc 读取（默认 100 kpc，
+# 覆盖全银河系含晕；ne2025_verify_plateau 可验证平台）。
+# 推断端不依赖 mwprop：以下函数内部延迟 import，未被调用时无额外依赖。
+
+def ne2025_dm_mw(gl, gb, dist_kpc=100.):
+    """单方向调用 mwprop，返回银河系总 DM [pc/cm^3]
+
+    调用: ne2025(ldeg=gl, bdeg=gb, dmd=dist_kpc, ndir=-1, classic=False)
+    ndir<0 为距离→DM 模式，总 DM 在返回字典 Dv['DM']；
+    classic=False 只关闭 Fortran 风格打印，不改数值。
+    重定向 stdout 防止 mwprop 意外打印刷屏；异常正常向外抛出。
+    """
+    import io
+    from contextlib import redirect_stdout
+    from mwprop.nemod.NE2025 import ne2025
+    with redirect_stdout(io.StringIO()):
+        Dk, Dv, Du, Dd = ne2025(ldeg=float(gl), bdeg=float(gb),
+                                dmd=float(dist_kpc), ndir=-1, classic=False)
+    return float(Dv['DM'])
+
+
+def _ne2025_worker(task):
+    """多进程 worker: 计算单方向 DM_MW, 失败返回 NaN（顶层函数, 兼容 Windows spawn）"""
+    gl, gb, dist_kpc = task
+    try:
+        return ne2025_dm_mw(gl, gb, dist_kpc)
+    except Exception:
+        return np.nan
+
+
+def ne2025_dm_mw_batch(vgl, vgb, dist_kpc=100., progress=200, nproc=1):
+    """批量计算银河系总 DM [pc/cm^3]，返回 (dm_mw, n_fail)
+
+    mwprop 的 ne2025() 是标量视线积分接口, numpy 广播无效, 纯 Python 又比
+    Fortran 慢 ~45 倍——nproc>1 时用 multiprocessing 并行是唯一有效加速
+    （服务器 Linux fork 启动开销可忽略; 每进程独立延迟 import mwprop）。
+    失败方向置 NaN; nproc=1 走串行路径（含进度与告警打印）。
+    """
+    vgl = np.atleast_1d(vgl)
+    vgb = np.atleast_1d(vgb)
+    n = len(vgl)
+    if nproc > 1 and n > 1:
+        import time
+        import multiprocessing as mp
+        tasks = [(float(vgl[i]), float(vgb[i]), float(dist_kpc)) for i in range(n)]
+        t0 = time.perf_counter()
+        with mp.Pool(nproc) as pool:
+            dm_mw = np.array(pool.map(_ne2025_worker, tasks,
+                                      chunksize=max(1, n // (nproc * 4))))
+        dt = time.perf_counter() - t0
+        n_fail = int(np.sum(~np.isfinite(dm_mw)))
+        print(f"  NE2025 完成: {n} 个方向, {nproc} 进程并行, "
+              f"{dt:.1f}s ({dt/max(n,1)*1000:.0f} ms/方向), 失败 {n_fail} 个")
+        return dm_mw, n_fail
+
+    dm_mw = np.full(n, np.nan)
+    n_fail = 0
+    import time
+    t0 = time.perf_counter()
+    for i in range(n):
+        try:
+            dm_mw[i] = ne2025_dm_mw(vgl[i], vgb[i], dist_kpc)
+        except Exception as e:
+            n_fail += 1
+            if n_fail <= 5:
+                print(f"[warn] (gl={vgl[i]:.2f}, gb={vgb[i]:.2f}) NE2025 计算失败: {e}")
+        if (i + 1) % progress == 0:
+            print(f"  NE2025 进度: {i+1}/{n} ({time.perf_counter()-t0:.1f}s)")
+    dt = time.perf_counter() - t0
+    print(f"  NE2025 完成: {n} 个方向, {dt:.1f}s ({dt/max(n,1)*1000:.0f} ms/方向), "
+          f"失败 {n_fail} 个")
+    return dm_mw, n_fail
+
+
+def ne2025_verify_plateau(vgl, vgb, dist_kpc=100.):
+    """平台验证：同一方向 dmd=50/100/150 kpc 三档，DM 应收敛（差异 <1%）
+
+    验证 dist_kpc 是否已覆盖全银河系（含晕）。取 3 个代表方向：
+    首个 + 银纬绝对值最高/最低的事件。
+    """
+    vgl = np.atleast_1d(vgl)
+    vgb = np.atleast_1d(vgb)
+    idx = sorted({0, int(np.argmax(np.abs(vgb))), int(np.argmin(np.abs(vgb)))})
+    print(f"\n[平台验证] 距离→DM 应随积分距离收敛（50/100/150 kpc，"
+          f"当前取值 {dist_kpc} kpc）:")
+    for i in idx:
+        dms = [ne2025_dm_mw(vgl[i], vgb[i], d) for d in (50, 100, 150)]
+        spread = (max(dms) - min(dms)) / max(dms) * 100
+        print(f"  (gl={vgl[i]:7.2f}, gb={vgb[i]:6.2f}): DM = "
+              + " / ".join(f"{d:.2f}" for d in dms) + f"   波动 {spread:.2f}%")
+
 
 def gammainc(alpha, x):
     if alpha==0:

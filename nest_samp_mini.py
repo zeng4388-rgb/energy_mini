@@ -92,16 +92,21 @@ if __name__ == '__main__':
                         help='Bool option: removing the DM from dark halo')
     parser.add_argument('--fits', action='store_true', dest='use_fits',
                         help='Load catalog from FITS file instead of txt')
+    parser.add_argument('-mw', action='store', dest='mwmodel', type=str, default=None,
+                        help='Milky Way electron density model: ne2001 / ymw16 / ne2025'
+                             ' (default: inferred from -g suffix, keeps old behavior)')
     parser.add_argument('--config', action='store', dest='config_path', type=str,
                         default='config_mini.json', help='Path to config.json')
 
     args = parser.parse_args()
+    t_total0 = time.perf_counter()
     fcat = args.fcat
     fsvy = args.fsvy
     fout = args.fout
     fgt = args.fgt
     bolhalo = args.bolhalo
     use_fits = args.use_fits
+    mwmodel = args.mwmodel
 
     # 加载全局配置
     config = load_config(args.config_path)
@@ -124,29 +129,42 @@ if __name__ == '__main__':
     if fsvy is None:
         fsvy = config['data']['survey_info_path']
 
-    # 加载数据（已预处理：排除重复暴 + 无 fluence 的 burst）
+    # 加载数据（已预处理：排除重复暴 + 无 fluence 的 burst + 六项质量筛选）
     if use_fits:
-        vF, vW, vDM_obs, vDM_ne2001, vDM_ymw16, vSVY = lf.LoadFitsCatalog(fcat)
-        # 根据银河系 DM 模型选择对应的河外 DM
-        if fgt and fgt.find('NE2001') >= 0:
-            vDME = vDM_ne2001  # 已经是 DM_obs - DM_MW(NE2001)
-        else:
-            vDME = vDM_ymw16   # 已经是 DM_obs - DM_MW(YMW16)
-        if bolhalo:
-            vDME = vDME - halo_dm
+        vF, vW, vDM_obs, vDM_ne2001, vDM_ymw16, vDM_ne2025, vSVY = lf.LoadFitsCatalog(fcat)
         vLOGF = np.log10(vF / vW)   # flux = fluence / width [Jy]
         vLOGW = np.log10(vW)
     else:
         frb_cat = lf.LoadCatalogue(fcat)
-        if fgt and fgt.find('NE2001') >= 0:
-            vDME = frb_cat['DM'] - frb_cat['DM_NE2001']
-        else:
-            vDME = frb_cat['DM'] - frb_cat['DM_YMW16']
-        if bolhalo:
-            vDME = vDME - halo_dm
+        vDM_ne2001 = frb_cat['DM'] - frb_cat['DM_NE2001']
+        vDM_ymw16 = frb_cat['DM'] - frb_cat['DM_YMW16']
+        vDM_ne2025 = None   # 遗留 TXT 路径无 NE2025 列
         vLOGF = np.log10(frb_cat['S'])
         vLOGW = np.log10(frb_cat['W'])
         vSVY = frb_cat['SURVEY']
+
+    # MW 模型选择（与 -g 宿主星系类型解耦；未指定 -mw 时按 -g 后缀推断，保持旧行为）
+    if mwmodel is None:
+        mwmodel = 'ne2001' if (fgt and fgt.find('NE2001') >= 0) else 'ymw16'
+    mwmodel = mwmodel.lower()
+    if mwmodel == 'ne2001':
+        vDME = vDM_ne2001   # 已经是 DM_obs - DM_MW(NE2001)
+    elif mwmodel == 'ymw16':
+        vDME = vDM_ymw16    # 已经是 DM_obs - DM_MW(YMW16)
+    elif mwmodel == 'ne2025':
+        if vDM_ne2025 is None:
+            raise ValueError("filtered.fits 无 dm_exc_ne2025 列: "
+                             "先在服务器跑 preprocess_catalog.py（勿加 --skip-ne2025）")
+        vDME = vDM_ne2025   # DM_obs - DM_MW(NE2025, mwprop 预计算)
+    else:
+        raise ValueError(f"未知 MW 模型: {mwmodel}（可选 ne2001 / ymw16 / ne2025）")
+    print(f'[samp] MW model = {mwmodel}, host galaxy type = {fgt}')
+
+    if bolhalo:
+        print('[warn] -halo 已弃用: 银河系晕 DM 已由 U[0, DMsmax] 显式卷积建模'
+              '（log_distr_efdmwz, DMsmax=60, 均值30=Dolag2015），'
+              '再扣 halo_dm 会重复扣除。仅 DM_MW 固定值敏感性实验时临时使用。')
+        vDME = vDME - halo_dm
 
     if fgt and fgt.find('ETG') >= 0:
         fgt = 'ETG'
@@ -202,5 +220,7 @@ if __name__ == '__main__':
                     resume=False,
                     verbose=True,
                     sampling_efficiency='model',
-                    n_live_points=500,
+                    n_live_points=1000,
                     outputfiles_basename=config['output']['nest_out_dir'] + 'samp/' + fout)
+    print(f"[samp] MultiNest 总耗时 {time.perf_counter()-t_total0:.1f}s "
+          f"({(time.perf_counter()-t_total0)/60:.1f} min)")

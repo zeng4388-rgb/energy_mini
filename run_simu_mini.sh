@@ -4,6 +4,13 @@
 set -e
 export OMP_NUM_THREADS=1
 
+# 脚本级计时
+T_START=$(date +%s)
+fmt_time() {
+    s=$1
+    printf "%dm %ds" $((s / 60)) $((s % 60))
+}
+
 fov=200
 galaxy_type=ALG_YMW16
 
@@ -25,4 +32,6 @@ do
     echo "Running nest_simu_mini.py for phi*=${phis}"
     python3 nest_simu_mini.py --config config_mini.json -f1 $fin1 -o $fout1 -g ${galaxy_type}
 done
+
+echo "[run_simu_mini.sh 完成, 耗时 $(fmt_time $(( $(date +%s) - T_START )))]"
 exit

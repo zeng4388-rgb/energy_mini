@@ -21,7 +21,7 @@ def Simu_FRBs_Eiso(phis, alpha, logEs, logE0, mu, sigma, dnu, ns, fov, npol, g, 
     1. 从截断 Schechter 函数采样 E_iso
     2. 从共动体积分布采样 z
     3. 从 log-normal 分布采样 w_rest
-    4. 计算 fluence: F = E_iso * (1+z) / (dnu * 4π * D_L² * Jyms2CGS)
+    4. 计算 fluence: F = E_iso * (1+z)^(2+α) / (dnu * 4π * D_L² * Jyms2CGS)，谱指数 α = -1.39 (Shin 2023)
     5. 计算流量: S = F / w_obs
     """
     res = np.zeros((ns, 10))
@@ -73,19 +73,22 @@ def Simu_FRBs_Eiso(phis, alpha, logEs, logE0, mu, sigma, dnu, ns, fov, npol, g, 
         # 统一用 SFR_evolution（Yuksel 2008），与推断端 kappa(z) 保持同一曲线
         vDMH = vDMH0 * np.sqrt(dis.SFR_evolution(vZ)) / np.sqrt(dis.SFR_evolution(0))
 
-        # 采样源内 DM
-        vDMS = np.random.uniform(0, 50, ns0)
+        # 采样银河系晕 DM: DM_MW,halo ~ U[0, DMsmax]，观测帧（z≈0）
+        # DM_MW = DM_MW,ISM + DM_MW,halo；ISM 部分真实数据由目录 dm_exc 列扣除，
+        # mock 的 DMe 与之对应(不含 ISM)。与推断端 log_distr_efdmwz 卷积窗口同源，
+        # 改值只改 frb_util.DMsmax。
+        vDMHalo = np.random.uniform(0, dis.DMsmax, ns0)
 
         # 计算 IGM DM
         vDMI = cos.DispersionMeasure_IGM(vZ)
 
-        # 外星系 DM
-        vDME = (vDMH + vDMS) / (1 + vZ) + vDMI
+        # 外星系 DM（DM_MW,halo 位于观测帧，直接相加，不除 (1+z)）
+        vDME = vDMH / (1 + vZ) + vDMI + vDMHalo
 
         # 检测阈值
         vft = tel.RMEq(sn0, g, tsys, npol, bw, vW)
 
-        # 从 E_iso 计算 fluence: F = E_iso * (1+z) / (dnu * 4π * D_L² * Jyms2CGS)
+        # 从 E_iso 计算 fluence: F = E_iso * (1+z)^(2+α) / (dnu * 4π * D_L² * Jyms2CGS)，α = -1.39 (Shin 2023)
         # 使用 Energy_to_Flu 反推
         vFlu = np.array([cos.Energy_to_Flu(z, e, dnu) for z, e in zip(vZ, vEiso * vEps)])
 
@@ -116,7 +119,7 @@ def Simu_FRBs_Eiso(phis, alpha, logEs, logE0, mu, sigma, dnu, ns, fov, npol, g, 
         res[nt:(nt + nlen), 6] = vZ[vFlux > vft][0:nlen]
         res[nt:(nt + nlen), 7] = vDMI[vFlux > vft][0:nlen]
         res[nt:(nt + nlen), 8] = vDMH[vFlux > vft][0:nlen]
-        res[nt:(nt + nlen), 9] = vDMS[vFlux > vft][0:nlen]
+        res[nt:(nt + nlen), 9] = vDMHalo[vFlux > vft][0:nlen]
         nt = nt + nlen
         ns = ns - nlen
         pct = float(nt) / ns0 * 100
@@ -136,7 +139,7 @@ if __name__ == '__main__':
     parser.add_argument('-logE0', action='store', dest='logE0', type=float,
                         help='log10 of lower energy cutoff E0 [erg]')
     parser.add_argument('-dnu', action='store', dest='dnu', type=float,
-                        help='Reference intrinsic spectral width [MHz]')
+                        help='观测带宽 Δν_obs [MHz] (CHIME: 400 MHz)')
     parser.add_argument('-mu', action='store', dest='mu', type=float,
                         help='Mean of logarithmic intrinsic width distribution')
     parser.add_argument('-sig', action='store', dest='sigma', type=float,
@@ -201,7 +204,9 @@ if __name__ == '__main__':
         else:
             raise ValueError(f"T_obs 未指定且 {fsvy} 中无 CHIME，请用 -Tobs 指定观测时长")
     print(f"[info] T_obs = {Tobs} hr, Ns = {Ns}")
+    t_simu0 = time.perf_counter()
 
     res = Simu_FRBs_Eiso(phis, alpha, logEs, logE0, mu, sigma, dnu, Ns, fov, npol, gain, Ts, bw, sn0, fgt=fgt)
-    header = f"T_obs {Tobs}\nS W T DMe thres logE Z DMi DMh DMs"
+    header = f"T_obs {Tobs}\nS W T DMe thres logE Z DMi DMh DMmw"
     np.savetxt(output, res, delimiter=' ', header=header, comments="#")
+    print(f"[simufrb] 生成 {Ns} 个 mock FRB, 总耗时 {time.perf_counter()-t_simu0:.1f}s")

@@ -2,7 +2,7 @@
 # ============================================================
 # cc_energy_mini 一键运行脚本
 # 按顺序执行完整管线：生成数据 → 采样(并行) → 绘图
-# 嵌套采样阶段：3 个任务(模拟+2个galaxy type)后台并行跑
+# 嵌套采样阶段：5 个任务(模拟 + 4 条真实样本线)后台并行跑
 # 任一步骤失败即中止（set -e），并统计各子脚本耗时
 # ============================================================
 
@@ -30,6 +30,12 @@ python3 preprocess_catalog.py
 T0=$(( $(date +%s) - T0_START ))
 echo ""
 
+echo "===== Step 0b/5: 数据分布图（dm_exc 三模型对比 + 样本概览） ====="
+T0B_START=$(date +%s)
+python3 pltdatadist.py --config config_mini.json
+T0B=$(( $(date +%s) - T0B_START ))
+echo ""
+
 echo "===== Step 1/5: 生成模拟数据 (Nfrb=300, phis=1e3) ====="
 T1_START=$(date +%s)
 bash simudat_mini.sh
@@ -37,9 +43,9 @@ T1=$(( $(date +%s) - T1_START ))
 echo ""
 
 # ====== 阶段 2：嵌套采样（3 个任务并行，各占 1 核） ======
-# run_simu_mini.sh(单任务) 与 run_samp_mini.sh(2 个 galaxy type 并行) 同时启动,
-# 合计 3 个嵌套采样进程并行。失败检测由子脚本自己的 set -e / wait 检查负责。
-echo "===== Step 2+3/5: 嵌套采样（并行跑 3 个任务） ====="
+# run_simu_mini.sh(单任务) 与 run_samp_mini.sh(4 条线并行) 同时启动,
+# 合计 5 个嵌套采样进程并行(5 核内)。失败检测由子脚本自己的 set -e / wait 检查负责。
+echo "===== Step 2+3/5: 嵌套采样（并行跑 5 个任务: 模拟 + 4 条真实样本线） ====="
 T23_START=$(date +%s)
 
 bash run_simu_mini.sh &
@@ -86,9 +92,10 @@ echo "  图片输出目录: plots_mini/"
 echo "=========================================="
 echo ""
 echo "========== 各步骤耗时统计 =========="
-printf "  Step 0  preprocess           : %s\n" "$(fmt_time $T0)"
+printf "  Step 0   preprocess           : %s\n" "$(fmt_time $T0)"
+printf "  Step 0b  datadist plots       : %s\n" "$(fmt_time $T0B)"
 printf "  Step 1  simudat              : %s\n" "$(fmt_time $T1)"
-printf "  Step 2+3 嵌套采样 (3任务并行) : %s\n" "$(fmt_time $T23)"
+printf "  Step 2+3 嵌套采样 (5任务并行) : %s\n" "$(fmt_time $T23)"
 printf "  Step 4a draw_sim             : %s\n" "$(fmt_time $T4A)"
 printf "  Step 4b draw_samp            : %s\n" "$(fmt_time $T4B)"
 echo "  -----------------------------------"
