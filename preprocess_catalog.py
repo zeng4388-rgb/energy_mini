@@ -163,7 +163,11 @@ def filter_quality(result):
     print(f"\n质量筛选结果:")
 
     # 0. 判据列 NaN 剔除（scat_time 不参与，见 docstring）
-    ok = np.isfinite(snr) & np.isfinite(dm) & np.isfinite(exc_ne) & np.isfinite(exc_ym)
+    #    width 也必须在内：下游把 log10(width) 直接喂进似然，坏宽度会以 NaN 的
+    #    形式静默穿过 np.where/erf 一路污染 lnlik（不报错，只是该事件的 P(z) 变垃圾）。
+    ok = (np.isfinite(snr) & np.isfinite(dm) & np.isfinite(exc_ne) & np.isfinite(exc_ym)
+          & np.isfinite(result['width']) & (result['width'] > 0)
+          & np.isfinite(result['fluence']) & (result['fluence'] > 0))
     print(f"  判据列 NaN:        {n0} → {np.sum(ok)} (排除 {n0 - np.sum(ok)})")
 
     # 1. 信噪比下限
@@ -171,7 +175,7 @@ def filter_quality(result):
     print(f"  snr_fitb >= 12:    {np.sum(ok)} → {np.sum(ok1)} (排除 {np.sum(ok) - np.sum(ok1)})")
     ok = ok1
 
-    # 2. 观测 DM 下限
+    # 2. 观测 DM 下限（实测纯 no-op：snr>=12 之后无事件 dm<100；保留以防样本定义变化）
     ok1 = ok & (dm >= 100)
     print(f"  dm_fitb >= 100:    {np.sum(ok)} → {np.sum(ok1)} (排除 {np.sum(ok) - np.sum(ok1)})")
     ok = ok1
@@ -331,6 +335,15 @@ if __name__ == '__main__':
     print(f"\n[1/6] 加载原始数据: {args.input}")
     data, col_names = load_raw_catalog(args.input)
 
+    # 选择函数参考计数（泊松项存活率 SURVIV 的分母族，写入 FITS header）：
+    # NREF10 = 全部行中 snr_fitb>=10 的行数——rate_2d_E(sn0=10) 模型检出的
+    # 目录对应物（含重复暴 burst；snr_fitb NaN 不计）。其余计数存档备查。
+    snr_raw = np.array(data['snr_fitb'], dtype=float)
+    fin_raw = np.isfinite(snr_raw)
+    n_burst = len(data)
+    n_ref10 = int((fin_raw & (snr_raw >= 10)).sum())
+    n_snr12 = int((fin_raw & (snr_raw >= 12)).sum())
+
     # 2. 筛选
     print(f"\n[2/6] 最小筛选（排除重复暴 + 无fluence）")
     filtered = filter_minimum(data)
@@ -339,10 +352,12 @@ if __name__ == '__main__':
     print(f"\n[3/6] 提取列并转换单位")
     result = extract_columns(filtered)
     print_summary(result)
+    n_minflt = len(result['fluence'])   # one-off + 有 fluence（筛选前基准计数）
 
     # 4. 数据质量筛选
     print(f"\n[4/6] 数据质量筛选（snr/dm/scat/DM_MW/注释列 六项标准）")
     result = filter_quality(result)
+    n_sample = len(result['fluence'])   # 六项筛选后的最终样本数
 
     # 5. NE2025 河外 DM（mwprop，需服务器环境）
     # 积分距离从 config 读取（analysis.mwprop_dist_kpc，默认 100 kpc）
@@ -378,9 +393,14 @@ if __name__ == '__main__':
     fits_out = args.output + '.fits'
     txt_out = args.output + '.txt'
     Path(fits_out).parent.mkdir(parents=True, exist_ok=True)
-    extra_header = {}
+    # 泊松项/到达率的样本存活率（rate_2d_E 只含辐射计阈值，六道筛靠此因子
+    # 进入似然；覆盖范围说明见 frb_util.read_selection_survival）
+    extra_header = {'NSAMPLE': n_sample, 'NMINFLT': n_minflt, 'NREF10': n_ref10,
+                    'NSNR12': n_snr12, 'NBURST': n_burst, 'SURVIV': n_sample / n_ref10}
     if mwprop_ver is not None:
-        extra_header = {'MWPVER': mwprop_ver, 'MWPDIST': dist_kpc}
+        extra_header.update({'MWPVER': mwprop_ver, 'MWPDIST': dist_kpc})
+    print(f"  泊松项存活率 SURVIV = {n_sample/n_ref10:.4f} (= {n_sample}/{n_ref10}; "
+          f"NMINFLT={n_minflt}, NSNR12={n_snr12}, NBURST={n_burst})")
     save_fits(result, fits_out, extra_header=extra_header)
     save_txt(result, txt_out)
 

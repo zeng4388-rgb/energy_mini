@@ -1,18 +1,28 @@
 #!/bin/sh
-# 模拟数据嵌套采样(单任务)
+# 模拟数据嵌套采样(单任务): 注入-恢复检验, 是宿主参数可辨识性的闸口
 
 set -e
 export OMP_NUM_THREADS=1
 
-# 脚本级计时
 T_START=$(date +%s)
+SUMMARY=""
 fmt_time() {
     s=$1
     printf "%dm %ds" $((s / 60)) $((s % 60))
 }
+# timed <标签> <命令...>: 单任务计时并累积摘要; 失败标 FAIL 后仍返回非零
+timed() {
+    name=$1; shift
+    t0=$(date +%s)
+    if "$@"; then tag=ok; else tag=FAIL; fi
+    SUMMARY="$SUMMARY  $name : $(fmt_time $(( $(date +%s) - t0 ))) [$tag]
+"
+    [ "$tag" = ok ]
+}
+# 失败时摘要也要打出来, 所以挂在 EXIT trap 上
+trap 'printf "%s" "$SUMMARY"' EXIT
 
 fov=200
-galaxy_type=ALG_YMW16
 
 mkdir -p nest_out_mini/simu
 mkdir -p simu_mini
@@ -30,7 +40,8 @@ do
     fi
 
     echo "Running nest_simu_mini.py for phi*=${phis}"
-    python3 nest_simu_mini.py --config config_mini.json -f1 $fin1 -o $fout1 -g ${galaxy_type}
+    timed "nest_simu phis=${phis}" python3 nest_simu_mini.py \
+        --config config_mini.json -f1 "$fin1" -o "$fout1"
 done
 
 echo "[run_simu_mini.sh 完成, 耗时 $(fmt_time $(( $(date +%s) - T_START )))]"

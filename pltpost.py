@@ -3,11 +3,10 @@
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib as mpl
-import sys
-import json
 import argparse
 import pymultinest
-from frb_util import load_config
+from scipy.ndimage import gaussian_filter
+from frb_util import (load_config, truth_vector, PARAM_ORDER, PARAM_UPPER_ONLY)
 
 plt.style.use("classic")
 #mpl.rcParams['font.family'] ='Times New Roman'
@@ -19,7 +18,7 @@ mpl.rcParams['axes.labelsize']=22
 def plot2dposterior_withconf(dat, likli, indx=[], labels=[], rate=0.5,
         par=np.array([]), truth_par=None,
                     parm=np.array([]), rangedat=np.array([]), levels=[0.68],
-                    bolupp=False):
+                    bolupp=False, upper_only=()):
     '''Plot a 2D posterier with likelihood burning curve
     dat: a n x m numpy matrix, each data point is a row
     indx: a array of integer indicating wich column (parameter) to plot
@@ -48,6 +47,33 @@ def plot2dposterior_withconf(dat, likli, indx=[], labels=[], rate=0.5,
         for i in range(0, col):
             rangedat[i, 0] = np.min(dat[:, i]);
             rangedat[i, 1] = np.max(dat[:, i]);
+
+    # --- 改进 1: 绘图范围分位数自动缩放 ---
+    # 先验区间仍是外框（prior_rangedat 留作 1D 面板的先验边界参考线）；非
+    # upper_only 参数改用后验 [0.5, 99.5]% 分位数缩放，直方图 100 个 bins 全部
+    # 花在后验核上而不是大片空白先验区。MAP 与注入真值线包进窗口（截断在先验
+    # 内）——恢复检验时真值线不会被裁掉，真值严重偏离时窗口随之拉大，本身就是
+    # 可见的诊断。upper_only（如 log_E0 上限参数）保留全范围：贴边堆积本身就是
+    # 结果，缩放会掩盖它。
+    prior_rangedat = np.array(rangedat, dtype=float, copy=True)
+    for i in range(0, col):
+        if i in upper_only:
+            continue
+        plo, phi_ = np.percentile(dat[:, i], [0.5, 99.5])
+        if not (np.isfinite(plo) and np.isfinite(phi_)):
+            continue
+        if phi_ - plo <= 0:
+            pad = max(1e-6, 1e-6 * abs(plo))
+            plo, phi_ = plo - pad, phi_ + pad
+        pts = [plo, phi_]
+        if par.size > 0:
+            pts.append(par[i])
+        if truth_par is not None:
+            pts.append(truth_par[i])
+        lo = max(prior_rangedat[i, 0], min(pts))
+        hi = min(prior_rangedat[i, 1], max(pts))
+        if hi > lo:
+            rangedat[i, 0], rangedat[i, 1] = lo, hi
 
     npar = col;
 
@@ -91,19 +117,20 @@ def plot2dposterior_withconf(dat, likli, indx=[], labels=[], rate=0.5,
                     rv=np.max(vom[histc>=thre])
                     print(vari, '-th parameter', 'sigma=', ls, 'lv=', lv, 'rv=', rv, thre)
 
-                    if vari != 3:
+                    if vari not in upper_only:
                         if ls == 0.68:
-                            plt.plot([lv, lv], [0, max(n)], ls='dashed', color='k', linewidth=1)
+                            plt.plot([lv, lv], [0, max(n)], ls='dashed', color='k', linewidth=1, label='68% CI')
                             plt.plot([rv, rv], [0, max(n)], ls='dashed', color='k', linewidth=1)
                         else:
                             plt.plot([lv, lv], [0, max(n)], ls='dotted', color='k', linewidth=1)
-                            plt.plot([rv, rv], [0, max(n)], ls='dotted', color='k', linewidth=1)
+                            plt.plot([rv, rv], [0, max(n)], ls='dotted', color='k', linewidth=1, label='95% CI')
                         print(rv-par[vari], lv-par[vari])
                     elif ls == 0.95:
                         print(rv)
-                        plt.plot([rv, rv], [0, max(n)], ls='solid', color='k', linewidth=2)
+                        plt.plot([rv, rv], [0, max(n)], ls='solid',
+                                 color='k', linewidth=2, label='95% upper')
 
-            if par.size > 0 and vari != 3:
+            if par.size > 0 and vari not in upper_only:
                 plt.plot([par[vari], par[vari]], [0, max(n)], ls='solid',
                          color='k', linewidth=2, label='MAP')
         else:
@@ -130,11 +157,11 @@ def plot2dposterior_withconf(dat, likli, indx=[], labels=[], rate=0.5,
                     rv=np.max(vom[histc>=thre])
                     print(vari, '-th parameter', 'sigma=', ls, 'lv=', lv, 'rv=', rv, thre)
                     if ls == 0.68:
-                        plt.plot([lv, lv], [0, max(n)], ls='dashed', color='k', linewidth=1)
+                        plt.plot([lv, lv], [0, max(n)], ls='dashed', color='k', linewidth=1, label='68% CI')
                         plt.plot([rv, rv], [0, max(n)], ls='dashed', color='k', linewidth=1)
                     else:
                         plt.plot([lv, lv], [0, max(n)], ls='dotted', color='k', linewidth=1)
-                        plt.plot([rv, rv], [0, max(n)], ls='dotted', color='k', linewidth=1)
+                        plt.plot([rv, rv], [0, max(n)], ls='dotted', color='k', linewidth=1, label='95% CI')
                     print(rv-par[vari], lv-par[vari])
             if par.size > 0:
                 plt.plot([par[vari], par[vari]], [0, max(n)], ls='solid',
@@ -142,14 +169,28 @@ def plot2dposterior_withconf(dat, likli, indx=[], labels=[], rate=0.5,
 
         if truth_par is not None:
             plt.plot([truth_par[vari], truth_par[vari]], [0, max(n)], ls='dashed',
-                     color='red', linewidth=2)
+                     color='red', linewidth=2, label='injected truth')
 
         if len(parm) > 0:
             for i in range(len(parm)):
                 parm0=parm[i]
                 plt.plot([parm0[vari], parm0[vari]], [0, max(n)], ls='dashed',
                      color='k', linewidth=2)
-        
+
+        # 缩放后若先验边界落在窗口内, 用灰点线标出(保留先验边界刻度)
+        if prior_rangedat[vari, 0] > rangedat[vari, 0]:
+            plt.plot([prior_rangedat[vari, 0]]*2, [0, max(n)], ls=':',
+                     color='0.6', lw=0.8)
+        if prior_rangedat[vari, 1] < rangedat[vari, 1]:
+            plt.plot([prior_rangedat[vari, 1]]*2, [0, max(n)], ls=':',
+                     color='0.6', lw=0.8)
+
+        # --- 改进 3: 图例(只放第一个 1D 面板, 避免每个面板重复) ---
+        if vari == 0:
+            handles, lbls = plt.gca().get_legend_handles_labels()
+            if lbls:
+                plt.legend(loc='best', fontsize=14, frameon=False)
+
         plt.xlim(rangedat[vari, :])
         #index of x
         for varj in range(vari + 1, npar):
@@ -172,6 +213,10 @@ def plot2dposterior_withconf(dat, likli, indx=[], labels=[], rate=0.5,
             extent = [xedges[0], xedges[-1], yedges[0], yedges[-1]]
             #hisogram is row leading need transpose to plot with contourf
             H = H.transpose()
+            # 改进 2: 高斯平滑(σ≈1 bin)后再画底色与置信度等高线。60×60 网格直接上
+            # 100 级 contourf 散斑大; 平滑压掉采样噪声, 质量排序置信度计算在同一
+            # 平滑场上进行, 底色与黑线自洽。
+            H = gaussian_filter(H, 1.0)
             #get the center of bin
             xedges = (xedges[:-1] + xedges[1:]) / 2
             yedges = (yedges[:-1] + yedges[1:]) / 2
@@ -215,6 +260,9 @@ def plot2dposterior_withconf(dat, likli, indx=[], labels=[], rate=0.5,
             xloc = plt.MaxNLocator(max_yticks)
             ax.yaxis.set_major_locator(xloc)
 
+    # 返回实际使用的绘图范围(缩放后), 供调用方/回归测试检查
+    return rangedat
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Plotting posteriors of the Bayesian inference')
     parser.add_argument('-f', action='store', dest='fname', type=str, help='Input catalog file')
@@ -226,7 +274,7 @@ if __name__ == '__main__':
                         help='Config file path (default: config_mini.json)')
     parser.add_argument('-truth', action='store', dest='truth_path', type=str, default=None,
                         help='注入真值 JSON 文件路径(原始物理单位): '
-                             'phis(线性), alpha, logEs, log_E0, mu_w, sigma_w。'
+                             'phis(线性), gamma, log_Echar, log_E0, mu_w, sigma_w, ln_mu_host, ln_sigma_host。'
                              '内部会对 phis 做 log10 变换以与后验链对齐。')
     args = parser.parse_args()
     fname = args.fname
@@ -238,33 +286,18 @@ if __name__ == '__main__':
     # 从 config 读取先验范围作为默认绘图范围（路径解析与 frb_util.load_config 一致）
     cfg = load_config(args.config_path)
     pri = cfg['prior']
-    rdat = np.array([
-        pri['log_phis'],   # log10(phis) 绘图范围
-        pri['alpha'],
-        pri['log_Es'],
-        pri['log_E0'],
-        pri['mu_w'],
-        pri['sigma_w']
-    ])
+    n_show = len(PARAM_ORDER)
+    keys = PARAM_ORDER[:n_show]
+    rdat = np.array([pri[k] for k in keys])
+    upper_only = tuple(i for i, k in enumerate(keys) if k in PARAM_UPPER_ONLY)
 
-    # 解析注入真值文件(若有),phis 内部做 log10 变换以与 mxchain[:,0] 对齐
+    # 解析注入真值文件(若有)。映射与 pltpz 共用 frb_util.truth_vector（单一实现）
     truth_par = None
     if args.truth_path:
-        with open(args.truth_path) as tf:
-            truth_dict = json.load(tf)
-        # 接受多种 key 命名以兼容不同写法
-        phis_val = truth_dict.get('phis', truth_dict.get('phi_star', truth_dict.get('phi*')))
-        truth_par = np.array([
-            np.log10(float(phis_val)),                  # log10(phis),与 mxchain[:,0] 一致
-            float(truth_dict.get('alpha')),
-            float(truth_dict.get('logEs', truth_dict.get('log_Es'))),
-            float(truth_dict.get('logE0', truth_dict.get('log_E0'))),
-            float(truth_dict.get('mu_w', truth_dict.get('mu'))),
-            float(truth_dict.get('sigma_w', truth_dict.get('sigma')))
-        ])
+        truth_par = truth_vector(args.truth_path)
         print(f'[truth] 注入真值(已 log10 phis): {truth_par}')
 
-    a = pymultinest.Analyzer(n_params = 6, outputfiles_basename=fname)
+    a = pymultinest.Analyzer(n_params = n_show, outputfiles_basename=fname)
     b = a.get_equal_weighted_posterior()
 
     vlik=b[:,-1]
@@ -277,14 +310,14 @@ if __name__ == '__main__':
     if bolout:
         plt.figure(figsize=(20, 16))
         plot2dposterior_withconf(mxchain, vlik, par=vpar, truth_par=truth_par, indx=[], rangedat=rdat, rate=1.0, levels=[0.68, 0.95],
-            labels=[r'$\log\,\phi^*$', r'$\alpha$', r'$\log E^*$', r'$\log E_0$', r'$\mu_w$', r'$\sigma_w$'],
-            bolupp=bolupp)
+            labels=[r'$\log\,\phi_0$', r'$\gamma$', r'$\log E_{\rm char}$', r'$\log E_0$', r'$\mu_w$', r'$\sigma_w$', r'$\ln\mu_{\rm host}$', r'$\ln\sigma_{\rm host}$'],
+            bolupp=bolupp, upper_only=upper_only)
         plt.suptitle(tit)
         plt.savefig(fout)
 
     else:
         plot2dposterior_withconf(mxchain, vlik, par=vpar, truth_par=truth_par, indx=[], rangedat=rdat, rate=1.0, levels=[0.68, 0.95],
-            labels=[r'$\log\,\phi^*$', r'$\alpha$', r'$\log E^*$', r'$\log E_0$', r'$\mu_w$', r'$\sigma_w$'],
-            bolupp=bolupp)
+            labels=[r'$\log\,\phi_0$', r'$\gamma$', r'$\log E_{\rm char}$', r'$\log E_0$', r'$\mu_w$', r'$\sigma_w$', r'$\ln\mu_{\rm host}$', r'$\ln\sigma_{\rm host}$'],
+            bolupp=bolupp, upper_only=upper_only)
         plt.suptitle(tit)
         plt.show()

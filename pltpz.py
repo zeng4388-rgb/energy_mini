@@ -4,16 +4,18 @@
 z 在推断中是隐变量（对 z 边际化），本脚本把每个事件的 P(z) 单独画出来——
 这是对 MW 模型选择最敏感的可视化（DM_MW 扣多扣少直接平移 P(z)）。
 
-参数来源（二选一）:
-    -par "phis alpha logEs logE0 mu sigma"   手动给定（mock 用注入真值）
-    -nest <MultiNest 输出前缀>                读 post_equal_weights.dat 取中位数
+参数来源（三选一, 均按 PARAM_ORDER 给满 8 个值）:
+    -par    "phis gamma log_Echar log_E0 mu_w sigma_w ln_mu_host ln_sigma_host"
+    -truth  <simudat_mini.sh 写的 .truth.json>   注入真值(恢复检验用它, 不必重抄参数)
+    -nest   <MultiNest 输出前缀>                 读 post_equal_weights.dat 取中位数
 
 用法（真实样本，参数取某条线后验中位数）:
     python3 pltpz.py --config config_mini.json -g ALG_YMW16 -mw ne2025 \
         -nest ./nest_out_mini/samp/ALG_NE2025 -o ./plots_mini/samp/ALG_NE2025_pz.pdf
 用法（mock 参数恢复检验，叠加注入真值 z）:
     python3 pltpz.py --config config_mini.json -g ALG_YMW16 -mw ymw16 \
-        -par "1e3 -1.5 43 38 0.4 0.3" -f1 ./simu_mini/simdat_1e3_200.txt \
+        -truth ./nest_out_mini/simu/simdat_1e3.truth.json \
+        -f1 ./simu_mini/simdat_1e3_200.txt \
         -o ./plots_mini/simu/pz_recovery.pdf
 """
 
@@ -26,26 +28,34 @@ matplotlib.use('Agg')
 import matplotlib.backends.backend_pdf as pdfback
 import matplotlib.pyplot as plt
 
-from frb_util import load_config, AstroDistribution, Loadfiles
+from frb_util import load_config, build_models, Loadfiles, PARAM_ORDER, truth_vector
 
 # numpy 1.x/2.x 兼容: np.trapz 自 2.0 起更名为 np.trapezoid（服务器旧环境保护）
 _trapz = getattr(np, 'trapezoid', None) or np.trapz
 
 
 def load_params(args):
-    """取 6 参数: -par 优先, 否则 -nest 的 post_equal_weights.dat 中位数"""
+    """取 len(PARAM_ORDER) 个参数: -par > -truth(注入真值 JSON) > -nest(后验中位数)
+
+    第 0 个分量的单位约定：链文件与 -par 用【线性】 phis（与 post_equal_weights
+    第 0 列、.truth.json 的 "phis" 键一致），-truth 走 truth_vector 返回 log10。
+    phis 完全不进入 P(z) 计算（只有 gamma/log_Echar/log_E0/宽度/宿主 DM 参与），
+    所以这里不做任何换算猜测，只在打印时把两种写法都列出来，避免误读。
+    """
     if args.par:
         v = [float(x) for x in args.par.replace(',', ' ').split()]
-        if len(v) != 6:
-            raise ValueError(f"-par 需要 6 个值 phis alpha logEs logE0 mu sigma, 得到 {len(v)}")
+        if len(v) != len(PARAM_ORDER):
+            raise ValueError("-par 需要 %d 个值: %s, 得到 %d" % (len(PARAM_ORDER), " ".join(PARAM_ORDER), len(v)))
         return np.array(v), 'manual'
+    if args.truth:
+        return truth_vector(args.truth), args.truth + ' (注入真值)'
     if args.nest:
         f = args.nest.rstrip('/') + 'post_equal_weights.dat'
         dat = np.loadtxt(f)
         if dat.ndim == 1:
             dat = dat[None, :]
-        return np.median(dat[:, :6], axis=0), f + ' median'
-    raise ValueError("必须给 -par 或 -nest 之一来定参数")
+        return np.median(dat[:, :len(PARAM_ORDER)], axis=0), f + ' median'
+    raise ValueError("必须给 -par / -truth / -nest 之一来定参数")
 
 
 def pz_stats(logL, vz):
@@ -75,7 +85,10 @@ def main():
     parser.add_argument('-mw', action='store', dest='mwmodel', type=str, default=None,
                         help='MW model: ne2001 / ymw16 / ne2025 (default: 按 -g 后缀推断)')
     parser.add_argument('-par', action='store', dest='par', type=str, default=None,
-                        help='"phis alpha logEs logE0 mu sigma"')
+                        help='8 个参数值: "phis gamma log_Echar log_E0 mu_w sigma_w ln_mu_host ln_sigma_host"')
+    parser.add_argument('-truth', action='store', dest='truth', type=str, default=None,
+                        help='注入真值 JSON（simudat_mini.sh 写的 .truth.json），'
+                             '恢复检验时用它而不是 -par，避免在 shell 里重抄一遍参数')
     parser.add_argument('-nest', action='store', dest='nest', type=str, default=None,
                         help='MultiNest 输出前缀（读 post_equal_weights.dat 中位数）')
     parser.add_argument('-f1', action='store', dest='simu1', type=str, default=None,
@@ -88,10 +101,8 @@ def main():
     t_start = time.perf_counter()
 
     config = load_config(args.config_path)
-    dnu = config.get('analysis', {}).get('dnu', 400.0)
+    dnu = config.get('analysis', {}).get('dnu', 1000.0)
     fgt = args.fgt
-    if fgt and fgt.find('ETG') >= 0:
-        fgt = 'ETG'
 
     # 数据与河外 DM
     lf = Loadfiles()
@@ -115,17 +126,22 @@ def main():
     print(f'[pltpz] N = {len(vLOGF)}, params from ', end='')
 
     vpar, src = load_params(args)
-    phis, alpha, logEs, logE0, mu, sigma = vpar
-    print(f'{src}: phis={phis:.3g} alpha={alpha:.3f} logEs={logEs:.2f} '
-          f'logE0={logE0:.2f} mu={mu:.3f} sigma={sigma:.3f}')
+    phis, gamma, logEs, logE0, mu, sigma, ln_mu_host, ln_sigma_host = vpar
+    print(f'{src}: phi0={phis:.4g} (log10={np.log10(phis) if phis > 0 else float("nan"):.3f}) '
+          f'gamma={gamma:.3f} log_Echar={logEs:.2f} '
+          f'log_E0={logE0:.2f} mu_w={mu:.3f} sigma_w={sigma:.3f} '
+          f'ln_mu_host={ln_mu_host:.3f} ln_sigma_host={ln_sigma_host:.3f}')
 
     # z 网格与逐事件似然网格 (nz, N)
-    dis = AstroDistribution()
+    # 必须走 build_models：过去这里只用裸 AstroDistribution()，于是系统误差线
+    # 画出来的 P(z) 仍按默认 dm_model/宇宙学，与同一条线的 MultiNest 后验不是同一个模型。
+    _, dis, _ = build_models(config)
     nz = 400
     vz = np.exp(np.arange(np.log(dis.Zmin), np.log(dis.Zmax),
                           (np.log(dis.Zmax) - np.log(dis.Zmin)) / nz))
     grid = dis.log_distr_efdmw_grid(dnu, vLOGF, vDME, vLOGW, vz,
-                                    alpha, logEs, logE0, mu, sigma, gtype=fgt)
+                                    gamma, logEs, logE0, mu, sigma,
+                                    ln_mu_host, ln_sigma_host)
 
     z_med = np.full(grid.shape[1], np.nan)
     z_lo = np.full_like(z_med, np.nan)

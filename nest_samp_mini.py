@@ -1,11 +1,8 @@
 #!/usr/bin/env python3
 
 import numpy as np
-from collections import Counter
 import time
 import pymultinest
-import warnings
-import sys
 import argparse
 
 from frb_util import *
@@ -16,60 +13,61 @@ er = EventRate()
 tel = Telescope()
 lf = Loadfiles()
 
-dnu = 400.0  # 默认值，__main__ 中从 config 更新
+dnu = 1000.0  # 能量定义参考带宽，__main__ 中从 config 更新
+SURVIVAL = 1.0  # Poisson 项样本存活率，__main__ 中从 filtered.fits header 读
 
 def lnlik(vpar):
-    """能量版似然函数
+    """能量版似然函数（CHIME 单巡天）。
 
-    vpar: [phis, alpha, log_Es, log_E0, mu_w, sigma_w]
+    vpar 顺序由 frb_util.PARAM_ORDER 定义（8 维全启用）。
+    项目决定不再扩展多巡天：tel_svy.txt 只取 CHIME 一行，三个 per-survey
+    循环（旧版 norm/loglik_fdm/rho 的 for i in range(len(vFOV))）已塌缩为标量。
+
+    异常口径（2026-10-09 收紧）：只吞【数值】失败，绝不 `except Exception`。
+    实测事故：igm_delta_nodes 形状 bug 抛 TypeError 被吞成 -1e30，似然在整个
+    先验空间恒为常数平台，MultiNest 照常"收敛"并输出一个看上去正常的平坦后验。
+    TypeError/AttributeError/KeyError 是接线错误，必须当场炸掉。
     """
     try:
         # 归一化因子（能量版）
-        norm = np.zeros(vFOV.shape)
-        for i in range(len(norm)):
-            norm[i] = dis.Norm1D_E(vSN0[i], vBW[i], vNpol[i], vG[i], vTs[i],
-                                   dnu, vpar[1], vpar[2], vpar[3], vpar[4], vpar[5])
+        norm = dis.Norm1D_E(vSN0, vBW, vNpol, vG, vTs,
+                            dnu, vpar[1], vpar[2], vpar[3], vpar[4], vpar[5])
         # 逐事件似然（能量版，对 z 边际化）
-        loglik_fdm = np.zeros(vFOV.shape)
-        for i in range(len(vFOV)):
-            loglik_fdm[i] = np.sum(
-                dis.log_distr_efdmw(dnu, vLOGF_2d[i], vDME_2d[i], vLOGW_2d[i],
-                                    vpar[1], vpar[2], vpar[3], vpar[4], vpar[5],
-                                    gtype=fgt) - np.log(norm[i]))
-        loglik_norm = np.sum(loglik_fdm)
+        loglik_norm = np.sum(
+            dis.log_distr_efdmw(dnu, vLOGF, vDME, vLOGW,
+                                vpar[1], vpar[2], vpar[3], vpar[4], vpar[5],
+                                vpar[6], vpar[7]) - np.log(norm))
         # 泊松似然（能量版事件率）
-        rho = np.zeros(vFOV.shape)
-        for i in range(len(rho)):
-            rho[i] = er.rate_2d_E(vSN0[i], vBW[i], vNpol[i], vG[i], vTs[i],
-                                  dnu, vpar[0], vpar[1], vpar[2], vpar[3],
-                                  vpar[4], vpar[5])
-        loglik_poi = np.sum(er.log_dis_poi(rho, vN, vFOV, vTime))
+        rho = er.rate_2d_E(vSN0, vBW, vNpol, vG, vTs,
+                           dnu, vpar[0], vpar[1], vpar[2], vpar[3],
+                           vpar[4], vpar[5])
+        # Λ_sel = Λ_det × S：rate_2d_E 只含辐射计阈值，样本还过了六道筛
+        # （覆盖范围说明见 frb_util.read_selection_survival）
+        loglik_poi = np.sum(er.log_dis_poi(np.array([rho * SURVIVAL]),
+                                           vN, vFOV, vTime))
         res = loglik_norm + loglik_poi
-        return res
-    except Exception:
+    except (ArithmeticError, ValueError):
+        # 数值域失败（OverflowError、brentq 括号失配等）：给一个有限的极低似然，
+        # 别让一次求值废掉整轮 10 小时的采样。
         import traceback
         print('Numerical error: @', vpar)
         traceback.print_exc()
         return -1e30
+    # numpy 默认只 warn 不抛，nan/inf 会一路穿到这里；MultiNest 的 C 层拿 nan
+    # 做比较是未定义行为，故显式兜底。
+    if not np.isfinite(res):
+        return -1e30
+    return res
 
 def myprior(cube, ndim, nparams):
-    """从 config.json 读取先验范围（能量参数）
+    """先验映射，顺序与形状全部来自 frb_util（附录 A 规则 R3/R4）。
 
-    cube[0] 输出 linear phis（下游 rate_2d_E 需要线性值）
-    cube[2], cube[3] 输出 log10(E*), log10(E0)
-
-    注意:参数顺序 [phis, alpha, log_Es, log_E0, mu_w, sigma_w] 在多处硬编码依赖:
-    - pltpost.py 第 97/109 行的 vari != 3 把 log_E0 特殊处理(只画 95% 上限)
-    - pltpost.py 第 245-252 行的 rangedat 顺序
-    改顺序要同步改那些地方。
+    cfg['prior'] 给支撑区间，cfg['prior_shape'] 可选地给区间内的分布形状
+    （如 ln_sigma_host 的截断正态）。两个采样脚本共用 prior_transform，
+    不再各自重复一遍映射表。
     """
-    cfg = config['prior']
-    cube[0] = 10.0 ** (cfg['log_phis'][0] + cube[0] * (cfg['log_phis'][1] - cfg['log_phis'][0]))
-    cube[1] = cfg['alpha'][0] + cube[1] * (cfg['alpha'][1] - cfg['alpha'][0])
-    cube[2] = cfg['log_Es'][0] + cube[2] * (cfg['log_Es'][1] - cfg['log_Es'][0])
-    cube[3] = cfg['log_E0'][0] + cube[3] * (cfg['log_E0'][1] - cfg['log_E0'][0])
-    cube[4] = cfg['mu_w'][0] + cube[4] * (cfg['mu_w'][1] - cfg['mu_w'][0])
-    cube[5] = cfg['sigma_w'][0] + cube[5] * (cfg['sigma_w'][1] - cfg['sigma_w'][0])
+    for i, key in enumerate(PARAM_ORDER[:ndim]):
+        cube[i] = prior_transform(key, cube[i], config)
 
 def myloglike(cube, ndim, nparams):
     cube2 = np.zeros(ndim)
@@ -86,10 +84,8 @@ if __name__ == '__main__':
                         help='Input Survey Information file')
     parser.add_argument('-o', action='store', dest='fout', type=str,
                         help='Output file basename')
-    parser.add_argument('-g', action='store', dest='fgt', type=str,
-                        help='Host galaxy type (ETG, LTG_NE2001, LTG_YMW16, ALG_NE2001, ALG_YMW16)')
-    parser.add_argument('-halo', action='store_true', dest='bolhalo',
-                        help='Bool option: removing the DM from dark halo')
+    parser.add_argument('-g', action='store', dest='fgt', type=str, default=None,
+                        help='仅用于未给 -mw 时推断 MW 模型(后缀 NE2001/YMW16); 宿主模型已统一为对数正态')
     parser.add_argument('--fits', action='store_true', dest='use_fits',
                         help='Load catalog from FITS file instead of txt')
     parser.add_argument('-mw', action='store', dest='mwmodel', type=str, default=None,
@@ -104,21 +100,15 @@ if __name__ == '__main__':
     fsvy = args.fsvy
     fout = args.fout
     fgt = args.fgt
-    bolhalo = args.bolhalo
     use_fits = args.use_fits
     mwmodel = args.mwmodel
 
     # 加载全局配置
     config = load_config(args.config_path)
     dnu = config.get('analysis', {}).get('dnu', TELESCOPES['CHIME']['dnu'])
-    halo_dm = config.get('analysis', {}).get('halo_dm', 0.0)
-    # 用 config 中的宇宙学参数创建新实例，并同步到 dis / er
-    cosmo_cfg = config.get('cosmology', {})
-    cos = Cosmology(omegam=cosmo_cfg.get('Omega_m', 0.308),
-                    omegal=cosmo_cfg.get('Omega_L', 0.692))
-    dis.cos = cos
-    er.cos = cos
-    er.ad = dis
+    # 宇宙学 + dm_model 一次性注入，并让 er 与 dis 共享同一个 cos（重绑模块全局，
+    # lnlik 用的就是这三个对象）
+    cos, dis, er = build_models(config)
 
     # 如果未指定 fcat/fsvy，从 config 读取默认路径
     if fcat is None:
@@ -131,17 +121,13 @@ if __name__ == '__main__':
 
     # 加载数据（已预处理：排除重复暴 + 无 fluence 的 burst + 六项质量筛选）
     if use_fits:
-        vF, vW, vDM_obs, vDM_ne2001, vDM_ymw16, vDM_ne2025, vSVY = lf.LoadFitsCatalog(fcat)
+        vF, vW, vDM_obs, vDM_ne2001, vDM_ymw16, vDM_ne2025, _ = lf.LoadFitsCatalog(fcat)
         vLOGF = np.log10(vF / vW)   # flux = fluence / width [Jy]
         vLOGW = np.log10(vW)
     else:
-        frb_cat = lf.LoadCatalogue(fcat)
-        vDM_ne2001 = frb_cat['DM'] - frb_cat['DM_NE2001']
-        vDM_ymw16 = frb_cat['DM'] - frb_cat['DM_YMW16']
-        vDM_ne2025 = None   # 遗留 TXT 路径无 NE2025 列
-        vLOGF = np.log10(frb_cat['S'])
-        vLOGW = np.log10(frb_cat['W'])
-        vSVY = frb_cat['SURVEY']
+        raise ValueError(
+            f"遗留 TXT 加载路径已移除（LoadCatalogue 的列约定与 preprocess 输出不兼容）。"
+            f"请改用 FITS：--fits 或把 config 的 catalog_path 指向 .fits（{fcat}）")
 
     # MW 模型选择（与 -g 宿主星系类型解耦；未指定 -mw 时按 -g 后缀推断，保持旧行为）
     if mwmodel is None:
@@ -158,53 +144,43 @@ if __name__ == '__main__':
         vDME = vDM_ne2025   # DM_obs - DM_MW(NE2025, mwprop 预计算)
     else:
         raise ValueError(f"未知 MW 模型: {mwmodel}（可选 ne2001 / ymw16 / ne2025）")
-    print(f'[samp] MW model = {mwmodel}, host galaxy type = {fgt}')
-
-    if bolhalo:
-        print('[warn] -halo 已弃用: 银河系晕 DM 已由 U[0, DMsmax] 显式卷积建模'
-              '（log_distr_efdmwz, DMsmax=60, 均值30=Dolag2015），'
-              '再扣 halo_dm 会重复扣除。仅 DM_MW 固定值敏感性实验时临时使用。')
-        vDME = vDME - halo_dm
-
-    if fgt and fgt.find('ETG') >= 0:
-        fgt = 'ETG'
+    print(f'[samp] MW model = {mwmodel} (宿主模型: 观测帧对数正态, 8 维)')
 
     print(f'[samp] 加载 {len(vLOGF)} 个已筛查 FRB（one-off，含 fluence）')
 
-    # 加载巡天信息
+    # 泊松项存活率：header 缺失当场报错，绝不默认 1.0（= 静默复现选择函数缺口）
+    # mode 取 dis.sel_mode（build_models 按 config/env 注入）⇒ SURVIV 分母与
+    # Norm1D_E/rate_2d_E 里用的 S 同一个模式，三处不可能分叉
+    SURVIVAL = read_selection_survival(fcat, mode=dis.sel_mode)
+
+    # 加载巡天信息：CHIME 单巡天（项目决定不再扩展），只取 CHIME 一行。
+    # 旧版按巡天分组的 Counter(vSVY) / vLOGF_2d 等列表已删除。
     svy_info = lf.LoadSvyInfo(fsvy)
-
-    # 按巡天分组
-    cts = Counter(vSVY)
-
-    # 自动检测巡天列表（从 tel_svy.txt 读取）
-    survey_names = svy_info['SURVEY']
-    vN = np.array([cts.get(s, 0) for s in survey_names])
-    vSN0 = svy_info['SN0']
-    vTs = svy_info['Tsys']
-    vG = svy_info['Gain']
-    vBW = svy_info['BW']
-    vNpol = svy_info['Npol']
-    vFOV = svy_info['FOV']
-    vTime = svy_info['TIME']
-
-    # 按巡天名称分组数据
-    vLOGF_2d = [vLOGF[vSVY == s] for s in survey_names]
-    vDME_2d = [vDME[vSVY == s] for s in survey_names]
-    vLOGW_2d = [vLOGW[vSVY == s] for s in survey_names]
+    names = list(svy_info['SURVEY'])
+    if 'CHIME' not in names:
+        raise ValueError(f"{fsvy} 中未找到 CHIME 行（本项目只支持单巡天）")
+    i = names.index('CHIME')
+    vSN0 = float(svy_info['SN0'][i])
+    vTs = float(svy_info['Tsys'][i])
+    vG = float(svy_info['Gain'][i])
+    vBW = float(svy_info['BW'][i])
+    vNpol = float(svy_info['Npol'][i])
+    # log_dis_poi 内部对 lamda 做布尔索引赋值，0-d 数组会抛 IndexError，
+    # 故 FOV/TIME/N 保持 1 元素数组。
+    vFOV = np.array([float(svy_info['FOV'][i])])
+    vTime = np.array([float(svy_info['TIME'][i])])
+    vN = np.array([float(len(vLOGF))])
 
     # 先验范围（从 config.json 读取）
     cfg = config['prior']
-    vpara = np.array([cfg['log_phis'][0], cfg['alpha'][0], cfg['log_Es'][0],
-                      cfg['log_E0'][0], cfg['mu_w'][0], cfg['sigma_w'][0]])
-    vparb = np.array([cfg['log_phis'][1], cfg['alpha'][1], cfg['log_Es'][1],
-                      cfg['log_E0'][1], cfg['mu_w'][1], cfg['sigma_w'][1]])
+    vpara = np.array([cfg[k][0] for k in PARAM_ORDER])
+    vparb = np.array([cfg[k][1] for k in PARAM_ORDER])
 
     print('------------par range-----------')
     print('lower:', vpara)
     print('upper:', vparb)
     a1 = time.perf_counter()
-    # sanity check：通过 myprior 变换后再求似然（vpara[0] 是 log_phis，不能直送 lnlik）
+    # sanity check：通过 myprior 变换后再求似然（vpara[0] 是 log_phi0，不能直送 lnlik）
     cube_test = np.zeros(len(vpara))
     myprior(cube_test, len(vpara), len(vpara))
     print(myloglike(cube_test, len(vpara), len(vpara)))

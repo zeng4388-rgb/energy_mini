@@ -4,22 +4,49 @@
     "survey_info_path": "tel_svy.txt"
   },
   "analysis": {
-    "halo_dm": 30.0,
-    "dnu": 400.0,
-    "mwprop_dist_kpc": 100.0
+    "dnu": 1000.0,
+    "mwprop_dist_kpc": 100.0,
+    "n_evol": 1.0,
+    "sfr_curve": "MD2014"
+  },
+  "selection": {
+    "model": "step",
+    "k_offset": 1.0
   },
   "cosmology": {
-    "H0": 67.8,
-    "Omega_m": 0.308,
-    "Omega_L": 0.692
+    "H0": 67.4,
+    "Omega_m": 0.315,
+    "Omega_L": 0.685,
+    "Omega_b": 0.0493
+  },
+  "dm_model": {
+    "igm": {
+      "N_nodes": 64,
+      "F": 0.32,
+      "alpha": 3,
+      "beta": 3,
+      "zmin_eff": 0.01
+    },
+    "host": {
+      "host_dm_evol": 0.84
+    },
+    "halo": {
+      "DMsmin": 0.0,
+      "DMsmax": 60.0
+    }
+  },
+  "prior_shape": {
+    "ln_sigma_host": {"kind": "truncnorm", "mu": 0.944, "sigma": 0.47}
   },
   "prior": {
-    "log_phis": [0.0, 5.0],
-    "alpha": [-4.0, 0.0],
-    "log_Es": [39.0, 44.0],
-    "log_E0": [33.0, 40.0],
+    "log_phi0": [-1.0, 6.5],
+    "gamma": [-4.0, 0.0],
+    "log_Echar": [39.0, 49.0],
+    "log_E0": [33.0, 42.0],
     "mu_w": [-1.0, 2.0],
-    "sigma_w": [0.01, 1.0]
+    "sigma_w": [0.01, 1.5],
+    "ln_mu_host": [2.5, 6.5],
+    "ln_sigma_host": [0.2, 3.0]
   },
   "output": {
     "nest_out_dir": "nest_out_mini/",

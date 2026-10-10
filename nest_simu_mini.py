@@ -3,8 +3,6 @@
 import numpy as np
 import time
 import pymultinest
-import warnings
-import sys
 import argparse
 
 from frb_util import *
@@ -22,11 +20,15 @@ fov = tel['fov']
 npol = tel['npol']
 sn0 = tel['sn0']
 dnu = tel['dnu']
+SURVIVAL = 1.0  # Poisson 项样本存活率，__main__ 中从 filtered.fits header 读
 
 def lnlik(vpar):
     """能量版似然函数（CHIME 单巡天）
 
-    vpar: [phis, alpha, log_Es, log_E0, mu_w, sigma_w]
+    vpar 顺序由 frb_util.PARAM_ORDER 定义（8 维全启用）。
+    异常口径与 nest_samp_mini.lnlik 一致（2026-10-09 收紧）：只吞数值失败，
+    接线错误必须当场炸。注入-恢复跑的是同一条似然链，这里若把 TypeError
+    吞成 -1e30，会得到一个"成功收敛"的平坦后验，恢复检验整轮作废。
     """
     try:
         norm = dis.Norm1D_E(sn0, bw, npol, g, tsys, dnu,
@@ -34,33 +36,30 @@ def lnlik(vpar):
         loglik_fdm = np.sum(
             dis.log_distr_efdmw(dnu, vLOGFLUX, vDME, vLOGW,
                                 vpar[1], vpar[2], vpar[3], vpar[4], vpar[5],
-                                gtype=fgt) - np.log(norm))
+                                vpar[6], vpar[7]) - np.log(norm))
         rho = er.rate_2d_E(sn0, bw, npol, g, tsys, dnu,
                            vpar[0], vpar[1], vpar[2], vpar[3], vpar[4], vpar[5])
-        loglik_poi = np.sum(er.log_dis_poi(np.array([rho]), vN, vFOV, vT))
+        # Λ_sel = Λ_det × S（与 nest_samp_mini 同一定义，见 read_selection_survival）
+        loglik_poi = np.sum(er.log_dis_poi(np.array([rho]) * SURVIVAL, vN, vFOV, vT))
         res = loglik_fdm + loglik_poi
-        return res
-    except Exception:
+    except (ArithmeticError, ValueError):
         import traceback
         print('Numerical error: @', vpar)
         traceback.print_exc()
         return -1e30
+    if not np.isfinite(res):
+        return -1e30
+    return res
 
 def myprior(cube, ndim, nparams):
-    """从 config 读取先验范围（能量参数）
+    """先验映射，顺序与形状全部来自 frb_util（附录 A 规则 R3/R4）。
 
-    注意:参数顺序 [phis, alpha, log_Es, log_E0, mu_w, sigma_w] 在多处硬编码依赖:
-    - pltpost.py 第 97/109 行的 vari != 3 把 log_E0 特殊处理(只画 95% 上限)
-    - pltpost.py 第 245-252 行的 rangedat 顺序
-    改顺序要同步改那些地方。
+    cfg['prior'] 给支撑区间，cfg['prior_shape'] 可选地给区间内的分布形状
+    （如 ln_sigma_host 的截断正态）。两个采样脚本共用 prior_transform，
+    不再各自重复一遍映射表。
     """
-    cfg = config['prior']
-    cube[0] = 10.0 ** (cfg['log_phis'][0] + cube[0] * (cfg['log_phis'][1] - cfg['log_phis'][0]))
-    cube[1] = cfg['alpha'][0] + cube[1] * (cfg['alpha'][1] - cfg['alpha'][0])
-    cube[2] = cfg['log_Es'][0] + cube[2] * (cfg['log_Es'][1] - cfg['log_Es'][0])
-    cube[3] = cfg['log_E0'][0] + cube[3] * (cfg['log_E0'][1] - cfg['log_E0'][0])
-    cube[4] = cfg['mu_w'][0] + cube[4] * (cfg['mu_w'][1] - cfg['mu_w'][0])
-    cube[5] = cfg['sigma_w'][0] + cube[5] * (cfg['sigma_w'][1] - cfg['sigma_w'][0])
+    for i, key in enumerate(PARAM_ORDER[:ndim]):
+        cube[i] = prior_transform(key, cube[i], config)
 
 def myloglike(cube, ndim, nparams):
     cube2 = np.zeros(ndim)
@@ -75,25 +74,21 @@ if __name__ == '__main__':
     parser.add_argument('-fs', action='store', dest='fsvy', type=str,
                         help='Survey info file (default: from config)')
     parser.add_argument('-o', action='store', dest='fout', type=str, help='Output file basename')
-    parser.add_argument('-g', action='store', dest='fgt', type=str, help='Host galaxy type')
     parser.add_argument('--config', action='store', dest='config_path', type=str,
                         default='config_mini.json', help='Path to config file')
     args = parser.parse_args()
     t_total0 = time.perf_counter()
     simu1 = args.simu1
     fout = args.fout
-    fgt = args.fgt
 
     # 加载全局配置
     config = load_config(args.config_path)
     dnu = config.get('analysis', {}).get('dnu', TELESCOPES['CHIME']['dnu'])
-    cosmo_cfg = config.get('cosmology', {})
-    cos = Cosmology(omegam=cosmo_cfg.get('Omega_m', 0.308),
-                    omegal=cosmo_cfg.get('Omega_L', 0.692))
-    # 同步宇宙学实例到 dis / er
-    dis.cos = cos
-    er.cos = cos
-    er.ad = dis
+    # 宇宙学 + dm_model 一次性注入，并让 er 与 dis 共享同一个 cos（重绑模块全局）
+    cos, dis, er = build_models(config)
+    # 与 nest_samp_mini 同一定义：Poisson 的观测数是筛选后样本，λ 需乘存活率。
+    # mode 取 dis.sel_mode（build_models 已按 config/env 注入）⇒ 分母与似然同源
+    SURVIVAL = read_selection_survival(config['data']['catalog_path'], mode=dis.sel_mode)
 
     # 从 tel_svy.txt 读取 CHIME 望远镜参数，覆盖模块级硬编码值
     # （保证与 nest_samp_mini.py / simufrb.py 用同一套参数源）
@@ -127,17 +122,15 @@ if __name__ == '__main__':
 
     # 先验范围（从 config 读取）
     cfg = config['prior']
-    vpara = np.array([cfg['log_phis'][0], cfg['alpha'][0], cfg['log_Es'][0],
-                      cfg['log_E0'][0], cfg['mu_w'][0], cfg['sigma_w'][0]])
-    vparb = np.array([cfg['log_phis'][1], cfg['alpha'][1], cfg['log_Es'][1],
-                      cfg['log_E0'][1], cfg['mu_w'][1], cfg['sigma_w'][1]])
+    vpara = np.array([cfg[k][0] for k in PARAM_ORDER])
+    vparb = np.array([cfg[k][1] for k in PARAM_ORDER])
 
     print('------------par range-----------')
     print('lower:', vpara)
     print('upper:', vparb)
     print(f'CHIME params: g={g}, bw={bw}, tsys={tsys}, fov={fov}, dnu={dnu}')
     a1 = time.perf_counter()
-    # sanity check：通过 myprior 变换后再求似然（vpara[0] 是 log_phis，不能直送 lnlik）
+    # sanity check：通过 myprior 变换后再求似然（vpara[0] 是 log_phi0，不能直送 lnlik）
     cube_test = np.zeros(len(vpara))
     myprior(cube_test, len(vpara), len(vpara))
     print(myloglike(cube_test, len(vpara), len(vpara)))
