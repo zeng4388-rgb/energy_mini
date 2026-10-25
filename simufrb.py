@@ -30,8 +30,6 @@ def Simu_FRBs_Eiso(phis, gamma, logEs, logE0, mu, sigma, dnu, ns, fov, npol, g, 
     sel_mode='smooth' 改用 McGregor 2026 实测的平滑探测概率 P(det|F, w_intrinsic)，
       见 chime_selection 模块。两种模式的 E0 截断与 ε 波束效率完全相同。
     """
-    if sel_mode not in ('step', 'smooth'):
-        raise ValueError("sel_mode 需为 'step' 或 'smooth'，得到 %r" % sel_mode)
     if poisson_survival is None:
         raise ValueError("Simu_FRBs_Eiso 需要显式 poisson_survival（filtered.fits header 的 "
                          "SURVIV，见 frb_util.read_selection_survival）：到达时间率必须是"
@@ -74,19 +72,22 @@ def Simu_FRBs_Eiso(phis, gamma, logEs, logE0, mu, sigma, dnu, ns, fov, npol, g, 
         # 采样 E_iso（截断 Schechter 能量函数）
         # gamma < -1 时 Schechter_E_log ∝ (E/E*)^(gamma+1)·exp(-E/E*) 单调递减，
         # 密度峰值落在低能端。若网格下限取 logE0-1 而 Sampling1D 的接受域是
-        # [logE0, 47]，归一化 ymax 就被窗口外(logE0-1)那个更高的点主导：
+        # [logE0, logE_hi]，归一化 ymax 就被窗口外(logE0-1)那个更高的点主导：
         # gamma=-2.6 时 y(logE0)/ymax = 10^(gamma+1) = 2.5%，接受率耗尽 10000 次迭代。
         # 把下限挪到 logE0（= 接受域左端点）使 ymax 落在支撑内，分布不变
-        # （[logE0,47] 上的网格取值完全相同，只改归一化常数），接受率提升 ~40 倍。
-        vlogE = np.arange(logE0, 48., (48. - logE0) / 10000)
-        # E 网格上界写死 47/48, 依赖"指数拐在上界之上有 100 倍以上余量"这一假设：
-        # logEs=44 时 10^47 = 1000·E*, 尾部 exp(-1000) 可忽略。config 先验上界是 44,
-        # 这条断言把假设写死, 将来抬高 log_Echar 先验时会当场报错而不是静默丢质量。
-        if not (logE0 < 47. and logEs <= 45.5):
-            raise ValueError(f"E 采样网格[logE0,47] 覆盖不足: logE0={logE0}, logEs={logEs}"
-                             f"（要求 logE0<47 且 logEs<=45.5）")
+        # （网格取值完全相同，只改归一化常数），接受率提升 ~40 倍。
+        # 上界自适应：接受域右端 = logEs + 3 dex（即 1000·E*，exp(-1000) 可忽略），
+        # 网格再多留 1 dex。旧写法把上界写死 47/48 且断言 logEs<=45.5，而 config 的
+        # log_Echar 先验是 [39,49] ⇒ PPC 抽到 logEs>45.5 的后验点就整轮 ValueError
+        # （实测 logEs=46 与 48.5 都当场抛）。logEs<=44 时 logE_hi 恰为 47，网格与
+        # 接受域和历史基线逐位一致（V10/V13/V14/V17/V18 注入的 41.4/43/43.398 全在内）。
+        logE_hi = max(47.0, float(logEs) + 3.0)
+        logE_grid_max = logE_hi + 1.0
+        if not (logE0 < logE_hi):
+            raise ValueError(f"E 采样网格覆盖不足: logE0={logE0} >= logE_hi={logE_hi}")
+        vlogE = np.arange(logE0, logE_grid_max, (logE_grid_max - logE0) / 10000)
         vlik = dis.Schechter_E_log(vlogE, 1, gamma, logEs)
-        vlogE = Sampling1D(vlogE, vlik, logE0, 47, ns0)
+        vlogE = Sampling1D(vlogE, vlik, logE0, logE_hi, ns0)
         vEiso = np.power(10., vlogE)
 
         # 采样 ε（波束效率，0.5-1）
@@ -124,6 +125,8 @@ def Simu_FRBs_Eiso(phis, gamma, logEs, logE0, mu, sigma, dnu, ns, fov, npol, g, 
         # DM_MW = DM_MW,ISM + DM_MW,halo；ISM 部分真实数据由目录 dm_exc 列扣除，
         # mock 的 DMe 与之对应(不含 ISM)。与推断端 log_distr_efdmwz 卷积窗口同源，
         # 改值只改 config 的 dm_model.halo。
+        # ⚠ 旧框架（frblf_erd / cc_energy 的 simufrb.py:66）把晕也 /(1+z) 搬进【源帧】；
+        # 晕在本星系内不该时间膨胀，现行两端统一观测帧相加，理由见 log_distr_efdmwz 的 ⚠ 段。
         vDMHalo = np.random.uniform(dis.DMsmin, dis.DMsmax, ns0)
 
         # 计算 IGM DM：均值(Macquart Eq.2 = James Eq.6 = Shin A12) × 准高斯涨落 Δ。
@@ -226,15 +229,17 @@ if __name__ == '__main__':
     parser.add_argument('-logE0', action='store', dest='logE0', type=float,
                         help='log10 of lower energy cutoff E0 [erg]')
     parser.add_argument('-dnu', action='store', dest='dnu', type=float,
-                        help='观测带宽 Δν_obs [MHz] (CHIME: 400 MHz)')
+                        help='能量定义的参考带宽 Δν_ref [MHz]（现行 1000 = Shin/James 的 1 GHz 约定；'
+                             '不是 CHIME 的观测带宽 400 MHz——那一项由 -bw 传，只进辐射计方程与 F50）')
     parser.add_argument('-mu', action='store', dest='mu', type=float,
                         help='Mean of logarithmic intrinsic width distribution')
     parser.add_argument('-sig', action='store', dest='sigma', type=float,
                         help='Std dev of logarithmic intrinsic width distribution')
-    parser.add_argument('-mu_host', action='store', dest='mu_host', type=float,
-                        help='ln-space median of observed-frame host DM at z=0')
-    parser.add_argument('-sigma_host', action='store', dest='sigma_host', type=float,
-                        help='ln-space width of host DM lognormal')
+    parser.add_argument('-ln_mu_host', action='store', dest='ln_mu_host', type=float,
+                        help='z=0 处宿主 DM 对数正态的【ln 空间】中位数参数 ln μ_host'
+                             '（旧旗标名 -mu_host 收的也是 ln 空间值，名字与量纲不符，已改）')
+    parser.add_argument('-ln_sigma_host', action='store', dest='ln_sigma_host', type=float,
+                        help='宿主 DM 对数正态的【ln 空间】宽度 ln σ_host')
     parser.add_argument('-ga', action='store', dest='gain', type=float,
                         help='Telescope gain [K/Jy]')
     parser.add_argument('-npol', action='store', dest='npol', type=int,
@@ -249,9 +254,15 @@ if __name__ == '__main__':
                         help='Field of view [deg^2]')
     parser.add_argument('-out', action='store', dest='output', help='Output file path')
     parser.add_argument('-Tobs', action='store', dest='Tobs', type=float,
-                        help='Total observation time [hr] (written to output header for nest_simu_mini.py)')
+                        help='总时长 [hr]，缺省从 tel_svy.txt 的 CHIME TIME 读取。'
+                             '只写进输出 header 备查：nest_simu_mini 的泊松项用 sum(T) '
+                             '列而不是这一格，两者相差 ns/λ 与巡天时长（见该脚本注释）')
     parser.add_argument('--config', action='store', dest='config_path', type=str,
                         default='config_mini.json', help='Path to config file')
+    parser.add_argument('-seed', action='store', dest='seed', type=int, default=None,
+                        help='随机种子(可选): 传入后 mock 完全可复现——同参数+同种子'
+                             '逐位同一份数据(演示/回归用); 缺省不播种, 保持历史行为'
+                             '(每次造数是一个新随机实现, 下游一切图的读数都会随之变化)')
 
     args = parser.parse_args()
     Ns = args.Ns
@@ -262,8 +273,8 @@ if __name__ == '__main__':
     dnu = args.dnu
     mu = args.mu
     sigma = args.sigma
-    ln_mu_host = args.mu_host
-    ln_sigma_host = args.sigma_host
+    ln_mu_host = args.ln_mu_host
+    ln_sigma_host = args.ln_sigma_host
     gain = args.gain
     npol = args.npol
     bw = args.bw
@@ -300,10 +311,18 @@ if __name__ == '__main__':
     # er.rate_2d_E 会按 er.ad.sel_mode 自动分派到 rate_2d_E_S ⇒ 平滑模式下
     # T 列与事件数同口径（旧 P3 的"率按 step、接受按 S"不自洽由此消除）。
     poisson_survival = read_selection_survival(config['data']['catalog_path'], mode=sel_mode)
+    if args.seed is not None:
+        np.random.seed(args.seed)
+        print(f"[simufrb] 随机种子 = {args.seed} —— 同参数重跑将逐位复现本份数据")
     res = Simu_FRBs_Eiso(phis, gamma, logEs, logE0, mu, sigma, dnu, Ns, fov, npol, gain, Ts, bw, sn0,
                          ln_mu_host=ln_mu_host, ln_sigma_host=ln_sigma_host,
                          poisson_survival=poisson_survival,
                          sel_mode=sel_mode, sel_k=sel_k)
     header = f"T_obs {Tobs}\nS W T DMe thres logE Z DMi DMh DMmw"
     np.savetxt(output, res, delimiter=' ', header=header, comments="#")
-    print(f"[simufrb] 生成 {Ns} 个 mock FRB, 总耗时 {time.perf_counter()-t_simu0:.1f}s")
+    # 打 len(res) 而不是 Ns：达到 max_iter 时 res 已被截断（见循环内的 [warn]），
+    # 报 Ns 会让人以为文件是满的，而下游注入-恢复是按行数算似然的。
+    n_got = len(res)
+    print(f"[simufrb] 生成 {n_got}/{Ns} 个 mock FRB"
+          + ("  ⚠ 被 max_iter 截断，事件数不足" if n_got < Ns else "")
+          + f", 总耗时 {time.perf_counter()-t_simu0:.1f}s")

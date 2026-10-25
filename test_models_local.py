@@ -1,16 +1,24 @@
 #!/usr/bin/env python3
-"""本地模型层验证套件 V1-V27（不需要 pymultinest / mwprop / P0 存档）。
+"""本地模型层验证套件 V1-V33（不需要 pymultinest / mwprop / P0 存档）。
 
 对应《代码改进方案.md》C11。全部为 assert 形式，任何一条失败即退出非零。
 用法:  python3 test_models_local.py
 
 边界: 本套件只验证模型层数学与接线正确性。采样行为、注入-恢复、PPC 必须在服务器上跑。
-V1-V4、V6-V16 是纯模型/接线判据，只依赖本目录的代码；V5 需要 data/filtered.fits
-（预处理产物，不随包分发），缺文件时打印 SKIP。V19-V23 是平滑选择函数
-（McGregor 2026）的钉：V19/V21 管表与判据形状，V20 管模拟端吞吐，
+V1-V4、V6-V16 是纯模型/接线判据，只依赖本目录的代码（astropy 已改为函数内延迟导入）；
+V5/V28/V30 需要 data/filtered.fits（预处理产物，不随包分发），缺文件时打印 SKIP。
+V19-V23 是平滑选择函数（McGregor 2026）的钉：V19/V21 管表与判据形状，V20 管模拟端吞吐，
 V22 管 mock↔似然口径配对，V23 管似然端原语的数值正确性。
 V24-V27 是准高斯 IGM 改造那一轮的钉：V24 管 dnu 能量轴口径，V25 管 gamma 上界
 的数值约束，V26 管抽样主表插值，V27 管"似然不得退化成 -1e30 常数平台"。
+V28-V31 是 2026-10-11 外部代码审查那一轮的钉：V28 实跑 pltpz 的真实样本分支
+（源码 grep 拦不住 UnboundLocalError），V29 管 log_Echar 先验上界角与抽样接口形状，
+V30 管样本必须按 sub_num==0 去重且 header 计数自洽，V31 管时间膨胀因子留在
+n_evol 幂次外。
+V32 是 2026-10-24 审查轮的钉：log_distr_efdmwz 的 1-D z 契约（IGM 准高斯重写把
+节点循环改成列形广播时被破坏：1-D z 静默广播出 (nz,nz) 垃圾）。
+V33 同轮：造数 -seed 与 pltpz 恢复表的可复现性/配对误差定义（用户"每次画图数据
+不一样"的反馈落地）。
 """
 import re
 import sys
@@ -18,7 +26,6 @@ from pathlib import Path
 
 import numpy as np
 import scipy.special as spf
-from astropy.io import fits
 
 from frb_util import (AstroDistribution, Cosmology, Loadfiles, PARAM_ORDER,
                       apply_dm_model, build_models, load_config,
@@ -31,6 +38,9 @@ _trapz = getattr(np, 'trapezoid', None) or np.trapz
 
 
 def _catalog():
+    # astropy 延迟到函数内导入（与 frb_util 同一约定）：本文件顶部 import 会让
+    # "V1-V4/V6-V16 是纯模型判据"这句承诺失效——轻量环境里连数学针都跑不起来。
+    from astropy.io import fits
     d = fits.getdata(str(HERE / "data" / "filtered.fits"))
     F = np.array(d["fluence"], float)
     W = np.array(d["width"], float)
@@ -54,7 +64,8 @@ def v1_mean_anchor():
 def v2_window_analytic():
     """晕窗 U[DMsmin, DMsmax] 的解析边际化 vs 暴力数值卷积, 相对误差 <0.1%。
 
-    跑两档: 主线 [0,60] 与系统误差线 [20,80]，两者都必须对得上。
+    跑两档宽度相同的窗: 在用的 [0,60] 与仅作算术核查的 [20,80]，两者都必须对得上
+    （[20,80] 不是副线: 晕窗解析积进 erf, 不占采样维, CC_HALO 覆盖已删除）。
     """
     ad = AstroDistribution()
     mu, s = np.log(33.0), 1.25
@@ -74,12 +85,17 @@ def v2_window_analytic():
 
 
 def v3_host_median_anchors():
-    """median_host^obs(z) = 33(1+z)^0.84 的三根 tripwire。"""
+    """宿主中位数的 (1+z)^host_dm_evol 观测帧幂律：三根 tripwire。
+
+    模型里已无写死的宿主中位数（ln_mu_host 是第 7 维自由参数），所以判据取【对 z=0 的
+    比值】而非绝对值；钉的是幂律指数与观测帧口径——指数漂离 0.84、或 (1+z) 被误挪到
+    源帧/被乘两次，都会在这里当场失败。
+    """
     ad = AstroDistribution()
-    for z, exp in ((0.2, 38.5), (1.0, 59.1), (1.5, 71.3)):
-        m = np.exp(np.log(33.0) + ad.host_dm_evol * np.log1p(z))
-        assert abs(m - exp) / exp < 0.005, (z, m, exp)
-    print("V3 PASS  median_host anchors ok")
+    for z, exp in ((0.2, 1.16549), (1.0, 1.79017), (1.5, 2.15907)):
+        ratio = np.exp(ad.host_dm_evol * np.log1p(z))
+        assert abs(ratio - exp) / exp < 0.005, (z, ratio, exp)
+    print("V3 PASS  median_host 观测帧幂律比值 ok")
 
 
 def _ig_mc(ad, sd, n, rng):
@@ -131,17 +147,28 @@ def v4_quadrature():
         ad.N_igm = 4 * old
         n256 = win(892.0 * ad.igm_delta_nodes(np.array([z]))[0]).mean()
         ad.N_igm = old
-        ad._ig_cache = {}
+        ad._ig_node_cache = {}
         assert abs(n64 / n256 - 1) < 5e-3, (sd, n64 / n256)
     # (iii)
     assert abs(ad._ig_solve_C0(0.24) - 1.58843) < 1e-4, ad._ig_solve_C0(0.24)
-    # 抽样端与独立 MC 对照（sd_ln 而非均值：均值被质心构造强制，宽度才暴露形状错）。
-    # 期望值来自《IGM准高斯替换方案.md》§3.1 表：σ_DM=0.32→0.328, 0.47→0.383。
+    # 抽样端双对照（sd_ln 而非均值：均值被质心构造强制为 1，宽度才暴露形状错）：
+    # (a) 绝对锚点, 来自《IGM准高斯替换方案.md》§3.1 表 σ_DM=0.32→0.328, 0.47→0.383;
+    # (b) _ig_mc 的独立拒绝采样——绕开 igm_delta_sample 与节点表共用的 _ig_tables,
+    #     不依赖任何文档数值, 形状/宽度写错(如把 α·σ_DM 写成 σ_DM)会当场分离。
+    #     V26 的参照取自 _ig_tables 的矩(与抽样共源), 抓不到"整张表一起错"的场合,
+    #     所以这里是不共源的第二把尺。
+    # (b) 阈值 0.03 的依据（实测 n=2e5, 2026-10-11）：igm_delta_sample 的 sd_ln 恒比
+    # 独立 MC 窄 1.6~1.9%，σ_DM 正好落在主表节点上与落在节点之间同一量级 ⇒ 主要不是
+    # ln σ_DM 插值(V26 单独钉), 而是分位表 N_U=1024 的分段线性插值余量。要收紧先把
+    # _IG_N_U 提到 4096(误差 ~O(h²) ⇒ 约 1/16) 再重测。
     for sd, want in ((0.32, 0.328), (0.47, 0.383)):
-        sm = ad.igm_delta_sample(np.full(30000, (ad.igm_F / sd) ** 2), 30000, rng)
+        z = (ad.igm_F / sd) ** 2
+        sm = ad.igm_delta_sample(np.full(30000, z), 30000, rng)
         got = np.log(sm).std()
+        mc = np.log(_ig_mc(ad, sd, 200000, rng)).std()
         assert abs(got - want) < 0.02, (sd, got, want)
-    print("V4 PASS  质心节点 <Δ>=1 精确; win 收敛 <0.1%%; C0(0.24)=%.5f; 抽样 sd_ln 对照通过"
+        assert abs(got / mc - 1) < 0.03, (sd, got, mc)
+    print("V4 PASS  质心节点 <Δ>=1 精确; win 收敛 <0.1%%; C0(0.24)=%.5f; 抽样 sd_ln 对文档锚点+独立 MC 双对照通过"
           % ad._ig_solve_C0(0.24))
 
 
@@ -149,7 +176,9 @@ def v5_degenerate_census():
     """全零 P(z) 事件数不得超过基线。
 
     基线沿革：M1 为 9/3373（对数正态 IGM + Planck2015 + dnu=400）；
-    2026-10-09 切准高斯 Δ_DM + Planck2018VI + dnu=1000、样本 1688 后实测为 0/1688。
+    2026-10-09 切准高斯 Δ_DM + Planck2018VI + dnu=1000、样本 1688 后实测为 0/1688；
+    2026-10-11 sub_num 去重后样本 1563（重复行是同值复制，不会新增退化事件，
+    读数仍应为 0；V30 单独钉"无重复行"）。
     阈值保留 9 作余量：这是单边真判据（"不得变多"），不是记账——若换 IGM 形状后
     冒出 >9 个，说明有事件在任何红移下都无法解释，是真实模型缺陷，须查事件本身，
     不许放宽阈值。
@@ -210,7 +239,25 @@ def v7_config_wiring():
     assert ad.host_dm_evol == cfg["dm_model"]["host"]["host_dm_evol"]
     assert ad.n_evol == cfg["analysis"]["n_evol"]
     assert len(PARAM_ORDER) == len(cfg["prior"]), (PARAM_ORDER, list(cfg["prior"]))
-    print("V7 PASS  config 接线与 PARAM_ORDER 一致 (%d 维)" % len(PARAM_ORDER))
+    # 缓存作废分支（2026-10-24 缓存改造的钉）：IGM 参数变化必须同时清空
+    # _ig_node_cache 与 _ig_samp_tab，且改 F 后节点行/抽样表 ln σ 区间都要
+    # 随新 F 重建——否则 F 括号线（0.09/0.5）沿用旧 F 的行/表，高 z 事件
+    # IGM 宽度静默全错（apply_dm_model 注释里的既述事故）。
+    ad2 = AstroDistribution()
+    apply_dm_model(ad2, cfg)
+    z1 = np.array([1.0])
+    r032 = ad2.igm_delta_nodes(z1).copy()
+    ad2._ig_sampling_table()
+    cfg_f009 = dict(cfg, dm_model=dict(cfg["dm_model"],
+                                       igm=dict(cfg["dm_model"]["igm"], F=0.09)))
+    apply_dm_model(ad2, cfg_f009)
+    assert ad2._ig_node_cache == {} and ad2._ig_samp_tab is None, "IGM 参数变化未清缓存"
+    assert not np.array_equal(ad2.igm_delta_nodes(z1), r032), "改 F 后节点行未随 F 变化"
+    _, lnsd09, _ = ad2._ig_sampling_table()
+    assert abs(lnsd09[0] - np.log(0.09 / np.sqrt(ad2.Zmax))) < 1e-12, \
+        "抽样表 ln σ 覆盖区间未随新 F 重建（旧下界会 clip 小 σ_DM）"
+    print("V7 PASS  config 接线与 PARAM_ORDER 一致 (%d 维); IGM 参数变化清空"
+          "节点行缓存+抽样表且按新 F 重建" % len(PARAM_ORDER))
 
 
 def v8_prior_shape():
@@ -538,7 +585,8 @@ def v17_poisson_survival():
     """Poisson 项/到达率的筛选存活率修复回归钉（选择函数缺口）。
 
     背景：rate_2d_E/Norm1D_E 的选择函数只含辐射计阈值（SNR>=10 + eps 波束），
-    而泊松项对比的观测数是六项质量筛选后的 NSAMPLE=1688——模型多预测 1/S 倍，
+    而泊松项对比的观测数是六项质量筛选后的 NSAMPLE=1563（2026-10-11 sub_num
+    去重后；去重前是 1688）——模型多预测 1/S 倍，
     φ* 被压低同倍数（历史拟合 3.48 与 4.56 是同一物理点在两个样本版本上的
     buggy 脊坐标；修后统一到 NREF10/(T·k)≈13.1）。修复：Λ_sel = Λ_det × S，
     S = NSAMPLE/NREF10 由 preprocess 实测写入 filtered.fits header；
@@ -550,11 +598,11 @@ def v17_poisson_survival():
     mock 无法逐事件模拟——模型 boxcar SNR 与目录 snr_fitb 的条件分位实测
     失配（mock 17.2% vs 实测 7.7%，P(SNR<12|SNR>=10)，见 (d) 附带读数），
     故 snr>=12 这道未做阈值化精确处理（若两估计量将来对齐可升格 sn0=12，
-    须 Norm1D_E/rate_2d_E/simufrb 三处同步）；scat<=10ms（716/3024=23.7%，
+    须 Norm1D_E/rate_2d_E/simufrb 三处同步）；scat<=10ms（736/3190=23.1%，
     最大单项）是唯一有对称性、可原理性进入选择函数的一道（tau(DM,z) 依赖
     探测概率），是 S 的下一轮缩水方向；dm_fitb>=100 实测纯 no-op；
     DM_MW<=100 与 notes 无对称性，只能留常数。S̄ 若将来 θ 依赖化，必须
-    同步进 Norm1D_E 与 rate_2d_E，否则 S̄(θ)^N 以 N=1688 杠杆扭曲后验。
+    同步进 Norm1D_E 与 rate_2d_E，否则 S̄(θ)^N 以 N=1563 杠杆扭曲后验。
 
     (a) header 读写+自洽校验; (b) CC_SURVIVAL 覆盖; (c) 修正脊 = N/(T·k·S)
     = NREF10/(T·k) 自洽且 = 未修正脊/S; (d) simufrb 同种子 T 列精确缩放、
@@ -567,17 +615,17 @@ def v17_poisson_survival():
     # (a) 临时 header 往返 + 自洽校验
     tmp = HERE / "_v17_survival_tmp.fits"
     hdu = afits.BinTableHDU.from_columns([afits.Column(name='x', format='D', array=[1.0])])
-    hdu.header['NSAMPLE'] = 1688
-    hdu.header['NREF10'] = 4840
-    hdu.header['SURVIV'] = 1688 / 4840
+    hdu.header['NSAMPLE'] = 1563
+    hdu.header['NREF10'] = 4334
+    hdu.header['SURVIV'] = 1563 / 4334
     afits.HDUList([afits.PrimaryHDU(), hdu]).writeto(str(tmp), overwrite=True)
     s = read_selection_survival(str(tmp))
-    assert abs(s - 1688 / 4840) < 1e-12, s
-    # (b) env 覆盖（one-off 口径系统误差线）
+    assert abs(s - 1563 / 4334) < 1e-12, s
+    # (b) env 覆盖（one-off 口径系统误差线：1563/3369，去重后重测）
     old = os.environ.get('CC_SURVIVAL')
-    os.environ['CC_SURVIVAL'] = '0.4723'
+    os.environ['CC_SURVIVAL'] = '0.4639'
     try:
-        assert abs(read_selection_survival(str(tmp)) - 0.4723) < 1e-12
+        assert abs(read_selection_survival(str(tmp)) - 0.4639) < 1e-12
     finally:
         if old is None:
             os.environ.pop('CC_SURVIVAL', None)
@@ -589,10 +637,10 @@ def v17_poisson_survival():
     cfg = load_config(str(HERE / "config_mini.json"))
     cos_, dis_, er_ = build_models(cfg)
     k = er_.rate_2d_E(10., 400., 2, 1.4, 50., 400., 1.0, -1.5, 43., 38., 0.4, 0.3) * 200.0
-    S = 1688 / 4840
-    phi_fix = 1688 / (26280.0 * k * S)
-    assert abs(phi_fix - 4840 / (26280.0 * k)) < 1e-9, "修正脊应等于辐射计计数匹配值"
-    assert abs((1688 / (26280.0 * k)) / phi_fix - S) < 1e-9, "未修正脊 = 修正脊 × S"
+    S = 1563 / 4334
+    phi_fix = 1563 / (26280.0 * k * S)
+    assert abs(phi_fix - 4334 / (26280.0 * k)) < 1e-9, "修正脊应等于辐射计计数匹配值"
+    assert abs((1563 / (26280.0 * k)) / phi_fix - S) < 1e-9, "未修正脊 = 修正脊 × S"
 
     # (d) simufrb：同种子下 T 列精确缩放、事件属性列不变（λ 不消耗 RNG）
     import simufrb
@@ -635,14 +683,14 @@ def v18_phis_recovery():
     （泊松不乘 S）的 MLE 落在 φ*_true×S——即选择函数缺口造成的压低因子
     本身，作为回归对照。形状参数固定为注入值，只 profile φ*：本钉检验
     泊松约束的归一化，不是形状可辨识性（那是服务器注入-恢复的事）。
-    S 直接用 preprocess 实测值 1688/4840（header 链路由 V17(a) 单独钉）。
+    S 直接用 preprocess 实测值 1563/4334（sub_num 去重后；header 链路由 V17(a) 单独钉）。
     """
     import simufrb
     cfg = load_config(str(HERE / "config_mini.json"))
     cos_, dis_, er_ = build_models(cfg)
     simufrb.cos, simufrb.dis, simufrb.er = cos_, dis_, er_
 
-    S = 1688 / 4840                                  # preprocess 实测（NREF10=4840）
+    S = 1563 / 4334                                  # preprocess 实测（NREF10=4334）
     phi_true, gamma, logEs, logE0, mu, sig = 10.0, -1.974, 41.43, 37.81, 0.459, 0.317
     mu_h, sig_h = 3.5, 1.24
     np.random.seed(2026)
@@ -1192,10 +1240,16 @@ def v26_igm_sampling_table_interp():
         ld = np.log(D)
         m1 = (w * ld).sum()
         exact = np.sqrt((w * ld * ld).sum() - m1 * m1)
-        sm = ad.igm_delta_sample(np.full(60000, z), 60000, rng)
+        sm = ad.igm_delta_sample(np.full(200000, z), 200000, rng)
         got = np.log(sm).std()
         assert abs(got / exact - 1) < 0.02, (z, got, exact)
-    print("V26 PASS  抽样主表 ln σ 插值误差 <2% (z=0.3/1/3)")
+        # 均值钉(2026-10-24)：分位表的分段线性插值让 <Δ> 恒偏低(实测 z=0.3 约
+        # -0.9~-1.3%, z=1 约 -0.7%, z=3 约 -0.45%, 敲定版 §13.4)。阈值 1.5% =
+        # 实测最差档 + MC 余量(1% 会因抽样噪声偶发假阳性, 首版即翻车)；此断言
+        # 防将来改 _IG_N_U/表构造时均值无感知恶化(此前只钉 sd_ln 不钉均值)。
+        gm = float(sm.mean())
+        assert abs(gm - 1.0) < 0.015, (z, gm)
+    print("V26 PASS  抽样主表 ln σ 插值误差 <2% 且 <Δ> 偏离 <1.5% (z=0.3/1/3)")
 
 
 def v27_likelihood_not_a_platform():
@@ -1256,6 +1310,209 @@ def v27_likelihood_not_a_platform():
           "两个入口 lnlik 只吞 ArithmeticError/ValueError + isfinite 兜底" % msg_b)
 
 
+def v28_pltpz_real_branch_runs():
+    """pltpz.py 的真实样本分支必须能【跑通】（子进程实跑，不是 grep 源码）。
+
+    事故：else 分支拿到 vF/vW 却漏算 vLOGF/vLOGW，真实模式一进来就
+    UnboundLocalError；而 V12 只用正则查了 'build_models(' 在不在源码里，全绿也拦不住，
+    要到 run_all Step 4b（三条线采样跑完几小时之后）才炸。
+    """
+    if not (HERE / "data" / "filtered.fits").exists():
+        print("V28 SKIP  缺 data/filtered.fits(预处理产物); 服务器上自动启用")
+        return
+    import subprocess
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        out = Path(td) / "pz.pdf"
+        # encoding 必须显式给 utf-8：Windows 上 text=True 会用本地代码页(gbk)解码子进程
+        # 输出，pltpz 打印的中文是 UTF-8 ⇒ 读线程 UnicodeDecodeError、r.stdout 变 None
+        # （子进程本身 rc=0 且 PDF 正常写出，纯粹是父进程解码炸了）。
+        r = subprocess.run([sys.executable, str(HERE / "pltpz.py"),
+                            "--config", str(HERE / "config_mini.json"),
+                            "-mw", "ne2001",
+                            "-par", "1e3 -1.5 43.4 38.4 0.4 0.3 3.5 0.944",
+                            "--nevt", "3", "-o", str(out)],
+                           cwd=str(HERE), capture_output=True, encoding='utf-8',
+                           errors='replace', timeout=1800)
+        assert r.returncode == 0, ("pltpz 真实样本模式失败:\n" + (r.stdout or '')[-1500:]
+                                   + "\n" + (r.stderr or '')[-1500:])
+        assert out.exists() and out.stat().st_size > 1000, "pltpz 没写出 PDF"
+        assert "line=ne2001" in (r.stdout or ''), (r.stdout or '')[-800:]
+        assert "phi0=1000" in (r.stdout or ''), "-par 的线性 phis 打印口径变了:\n" + (r.stdout or '')[-800:]
+        kb = out.stat().st_size / 1024.     # 临时目录退出即删，尺寸必须在 with 内取
+    print("V28 PASS  pltpz 真实样本分支实跑通过(-mw ne2001, PDF %.0f kB, phi0 口径正确)" % kb)
+
+
+def v29_high_echar_corner_and_sampler_api():
+    """(a) config 的 log_Echar 先验上界必须能被 mock 端接受；(b) 抽样接口形状。
+
+    (a) 事故：simufrb 把 E 采样网格上界写死 47/48 且断言 logEs<=45.5，而 config 先验
+        是 [39,49] ⇒ PPC 抽到 logEs>45.5 的后验点整轮 ValueError（实测 46.0 与 48.5
+        都当场抛）。现在上界 = max(47, logEs+3)；logEs<=44 时仍是 47，历史基线
+        （V10/V13/V14/V17/V18 注入的 41.4/43/43.398）逐位不变。
+    (b) igm_delta_sample 过去在 len(z)<size 时走到 i0[i] 抛 IndexError（标量 z 正是
+        这种情况）；现在标量广播、短数组当场报错。
+    """
+    import simufrb
+    from simufrb import Simu_FRBs_Eiso
+    cfg = load_config(str(HERE / "config_mini.json"))
+    cos_, dis_, er_ = build_models(cfg)
+    simufrb.cos, simufrb.dis, simufrb.er = cos_, dis_, er_
+    hi = float(cfg['prior']['log_Echar'][1])
+    assert 43.398 + 3.0 <= 47.0, "注入点 logEs=43.398 已越过 47，历史基线网格不再逐位一致"
+    kw = dict(dnu=1000., ns=20, fov=200., npol=2, g=1.4, tsys=50., bw=400., sn0=10.,
+              ln_mu_host=3.5, ln_sigma_host=1.24, poisson_survival=0.36)
+    r = Simu_FRBs_Eiso(1e3, -1.5, hi, 38.4, 0.4, 0.3, **kw)
+    assert len(r) == 20, len(r)
+    assert np.all(np.isfinite(r)), "先验上界角产出了非有限值"
+    ad = dis_
+    assert ad.igm_delta_sample(1.0, 500, np.random.default_rng(3)).shape == (500,)
+    try:
+        ad.igm_delta_sample(np.array([0.5, 1.0]), 500, np.random.default_rng(3))
+        raise AssertionError("len(z)<size 未被拦住")
+    except ValueError:
+        pass
+    print("V29 PASS  log_Echar=%.1f 先验上界角可采样(20/20 有限); 抽样接口标量 z 广播、短数组报错" % hi)
+
+
+def v30_sample_deduplicated():
+    """filtered.fits 必须一行一个独立暴（sub_num==0），且 header 计数自洽。
+
+    事故：Cat2 里一个暴的多个子暴行（sub_num>0）在我们提取的所有物理列上【完全相同】
+    （实测 FRB20200116B 九行、九个字段逐位一样，只有 sub_num 递增），而 repeater_name
+    为空 ⇒ 原样通过 one-off 判据全部入样。未去重时 1688 行只有 1563 个唯一 tns_name
+    （94 个暴重复：73×2 / 16×3 / 4×4 / 1×9，多出 125 行），逐事件似然把 snr=242 的
+    最亮事件当 9 个独立样本，同时 NREF10 4840→4334、NSNR12 4529→4024、
+    NSAMPLE 1688→1563、SURVIV 0.34876→0.36064。
+    """
+    p = HERE / "data" / "filtered.fits"
+    if not p.exists():
+        print("V30 SKIP  缺 data/filtered.fits(预处理产物); 服务器上自动启用")
+        return
+    from astropy.io import fits
+    with fits.open(str(p)) as h:
+        d, hdr = h[1].data, h[1].header
+        names = np.array(d['name'].astype(str))
+    u, c = np.unique(names, return_counts=True)
+    dup = int((c > 1).sum())
+    assert dup == 0, ("%d 个暴重复出现(多出 %d 行), 例: %s"
+                      % (dup, len(names) - len(u), list(u[c > 1][:5])))
+    if 'NSAMPLE' in hdr:
+        assert int(hdr['NSAMPLE']) == len(names), (int(hdr['NSAMPLE']), len(names))
+        assert abs(float(hdr['SURVIV']) - len(names) / int(hdr['NREF10'])) < 1e-9
+        print("V30 PASS  样本 %d 行 = %d 个唯一 tns_name; header NSAMPLE=%d NREF10=%d "
+              "SURVIV=%.5f 自洽" % (len(names), len(u), int(hdr['NSAMPLE']),
+                                    int(hdr['NREF10']), float(hdr['SURVIV'])))
+    else:
+        print("V30 PASS  样本 %d 行 = %d 个唯一 tns_name（header 无 NSAMPLE，跳过计数校验）"
+              % (len(names), len(u)))
+
+
+def v31_time_dilation_outside_power():
+    """时间膨胀 (1+z)^-1 必须在 n_evol 幂次【外】（Shin A8 / James Eq.13 原式）。
+
+    旧实现把 (1+z) 折进幂内：n=1 时恒等，n≠1 时差 (1+z)^(1-n)，n=0 会把时间膨胀
+    整个丢掉（先验中位 z 偏 +28.6%）。config 的 analysis.n_evol 是暴露给用户扫的
+    网格参数，所以不能只靠"n 固定 1.0"的口头约定。
+    """
+    ad = AstroDistribution()
+    z = np.array([0.05, 0.3, 1.0, 2.5, 4.9])
+    ratio = ad.SFR_evolution(z) / ad.SFR_evolution(0.0)
+    for n in (0.0, 0.5, 1.0, 1.5, 2.0):
+        got = ad.evolution_factor(z, n_evol=n)
+        want = np.power(ratio, n) / (1.0 + z)
+        assert np.max(np.abs(got / want - 1)) < 1e-12, (n, got, want)
+    # n=0 时时间膨胀仍在（旧实现会把它一起丢掉的那一项）
+    assert np.max(np.abs(ad.evolution_factor(z, n_evol=0.0) * (1.0 + z) - 1.0)) < 1e-12
+    # n=1 与旧的"折进幂内"写法逐点一致 ⇒ 现行基线不因这次改动漂移
+    old = np.power(ratio / (1.0 + z), 1.0)
+    assert np.max(np.abs(ad.evolution_factor(z) / old - 1)) < 1e-12
+    print("V31 PASS  (1+z)^-1 在幂外: n∈{0,0.5,1,1.5,2} 全对齐原式; n=1 与旧写法逐点相同")
+
+
+def v32_logdistr_1dz_contract():
+    """log_distr_efdmwz 的 z 形状契约：1-D z 必须给出与 (nz,1) 列形逐位相同的 (nz,N)。
+
+    事故：IGM 准高斯重写把 DM 通道节点循环改成 dmi_mean × nodes[:, j:j+1]（列形），
+    入口 z 若是 1-D (nz,)，(nz,)×(nz,1) 广播出 (nz,nz)：N==nz 时【静默】返回错误
+    形状的矩阵（对角线碰巧正确，其余是外积垃圾），N!=nz 抛难懂的 broadcast
+    ValueError。log_distr_efdmw 的注释承诺 "z(nz,) × event(N,) → (nz,N)"，
+    修复 = 入口把 1-D z 规范成 (nz,1) 列。
+    """
+    ad = build_models(load_config(str(HERE / "config_mini.json")))[1]
+    nz, n_ev = 6, 9
+    rng = np.random.default_rng(5)
+    vz = np.linspace(0.05, 2.0, nz)
+    dme = rng.uniform(200.0, 1500.0, n_ev)
+    lf = rng.uniform(-1.5, 0.5, n_ev)
+    lw = rng.uniform(-0.5, 0.8, n_ev)
+    rest = (-1.5, 43.4, 38.4, 0.4, 0.3, 3.5, 0.977)
+    got = ad.log_distr_efdmwz(1000., lf, dme, lw, vz, *rest)
+    want = ad.log_distr_efdmwz(1000., lf, dme, lw, vz[:, np.newaxis], *rest)
+    assert got.shape == (nz, n_ev), got.shape
+    assert np.array_equal(got, want), float(np.max(np.abs(got - want)))
+    print("V32 PASS  log_distr_efdmwz 吃 1-D z: 形状 (nz,N)=%s，与 (nz,1) 列形逐位相同"
+          % (got.shape,))
+
+
+def v33_mock_and_pz_determinism():
+    """造数与 P(z) 恢复表的可复现性钉（2026-10-24，用户"每次画图数据不一样"反馈落地）。
+
+    (a) simufrb -seed：同参数同种子两次造数，输出文件必须逐字节一致
+        （不传 -seed 保持历史行为：每次是新随机实现，属预期而非 bug）；
+    (b) pltpz 对同一 mock 跑两遍：分箱恢复表逐字一致，且 bias 列必须是
+        【配对误差】 med(z_med - z_true) —— 不是 med(z_med)-箱心（后者低 z 端被
+        z>=0 边界抬高，实测 +0.18 vs +0.06，曾与用户参考图对不上即此因）；
+    (c) 页 1 选样为确定性（按 DM 排序中央 90% 等距），静态钉标题措辞。
+    """
+    import json
+    import subprocess
+    import tempfile
+    if not (HERE / "data" / "filtered.fits").exists():
+        print("V33 SKIP  缺 data/filtered.fits(simufrb CLI 需要存活率 header); 服务器上自动启用")
+        return
+    with tempfile.TemporaryDirectory() as td:
+        tp = Path(td)
+        base = ['-ns', '40', '-phis', '1e3', '-gamma', '-1.5', '-logEs', '43.398',
+                '-logE0', '38.398', '-dnu', '1000', '-mu', '0.4', '-sig', '0.3',
+                '-ln_mu_host', '3.5', '-ln_sigma_host', '1.24', '-ga', '1.4',
+                '-npol', '2', '-bw', '400', '-ts', '50', '-sn0', '10', '-fov', '200',
+                '--config', str(HERE / 'config_mini.json'), '-seed', '2026']
+        blobs = []
+        for tag in 'ab':
+            o = tp / f'mock_{tag}.txt'
+            r = subprocess.run([sys.executable, str(HERE / 'simufrb.py'), *base,
+                                '-out', str(o)], capture_output=True, encoding='utf-8',
+                               errors='replace', timeout=1800)
+            assert r.returncode == 0, (r.stdout or '')[-600:] + (r.stderr or '')[-600:]
+            blobs.append(o.read_bytes())
+        assert blobs[0] == blobs[1], "-seed 同种子两次造数, 文件不一致"
+
+        truth = tp / 'mock.truth.json'
+        truth.write_text(json.dumps({'phis': 1e3, 'gamma': -1.5, 'logEs': 43.398,
+                                     'logE0': 38.398, 'mu_w': 0.4, 'sigma_w': 0.3,
+                                     'ln_mu_host': 3.5, 'ln_sigma_host': 1.24}),
+                         encoding='utf-8')
+        tabs, out_last = [], ''
+        for run_ in range(2):
+            o = tp / f'pz_{run_}.pdf'
+            r = subprocess.run([sys.executable, str(HERE / 'pltpz.py'), '--config',
+                                str(HERE / 'config_mini.json'),
+                                '-f1', str(tp / 'mock_a.txt'), '-truth', str(truth),
+                                '-o', str(o)], capture_output=True, encoding='utf-8',
+                               errors='replace', timeout=1800, cwd=str(HERE))
+            assert r.returncode == 0, (r.stdout or '')[-600:] + (r.stderr or '')[-600:]
+            assert o.stat().st_size > 1000
+            out_last = r.stdout or ''
+            tabs.append([l for l in out_last.splitlines() if re.match(r'^  \d+\.\d+', l)])
+        assert tabs[0] and tabs[0] == tabs[1], tabs
+        assert 'med(z_med-z_true)' in out_last, "bias 列必须是配对误差定义"
+        src = (HERE / 'pltpz.py').read_text(encoding='utf-8')
+        assert 'central 90% DM' in src, "页 1 确定性选样(中央 90%)的标题措辞被改"
+    print("V33 PASS  -seed 两跑逐字节一致; pltpz 分箱表两跑逐字一致, bias=配对误差"
+          " med(z_med-z_true); 页1 确定性选样钉住")
+
+
 def main():
     v1_mean_anchor()
 
@@ -1285,6 +1542,12 @@ def main():
     v25_gamma_upper_bound_guard()
     v26_igm_sampling_table_interp()
     v27_likelihood_not_a_platform()
+    v28_pltpz_real_branch_runs()
+    v29_high_echar_corner_and_sampler_api()
+    v30_sample_deduplicated()
+    v31_time_dilation_outside_power()
+    v32_logdistr_1dz_contract()
+    v33_mock_and_pz_determinism()
     print("\nALL LOCAL TESTS PASS")
     return 0
 

@@ -76,6 +76,7 @@ def plot2dposterior_withconf(dat, likli, indx=[], labels=[], rate=0.5,
             rangedat[i, 0], rangedat[i, 1] = lo, hi
 
     npar = col;
+    leg_handles, leg_labels = [], []   # 图例句柄(vari==0 收集), 主循环外统一放置
 
     #index of y
     for vari in range(0, npar):
@@ -87,11 +88,12 @@ def plot2dposterior_withconf(dat, likli, indx=[], labels=[], rate=0.5,
         n, bins, patches = plt.hist(dat[ind, vari], 100, density=True, \
                                     histtype='stepfilled', range=(rangedat[vari, 0], rangedat[vari, 1]))
         plt.setp(patches, 'facecolor', 'lightblue', 'alpha', 0.6)
-        yloc = plt.MaxNLocator(max_yticks)
-        ax.xaxis.set_major_locator(yloc)
-        xloc = plt.MaxNLocator(max_yticks)
-        ax.yaxis.set_major_locator(xloc)
-        plt.xlabel(labels[vari])
+        # 1D 面板: x/y 刻度都保留(纵坐标=概率密度, 数值可见), 字号收小——8x8
+        # 网格下面板仅 ~2 inch 宽, 全局 16 号会挤成 "35.037.540.0"; 刻度数收 4/3。
+        ax.xaxis.set_major_locator(plt.MaxNLocator(max_yticks))
+        ax.yaxis.set_major_locator(plt.MaxNLocator(3))
+        ax.tick_params(axis='both', labelsize=10)
+        plt.xlabel(labels[vari], fontsize=14)
         if bolupp:
             if len(levels)>0:
                 for ls in [0.68, 0.95]:
@@ -111,7 +113,11 @@ def plot2dposterior_withconf(dat, likli, indx=[], labels=[], rate=0.5,
                     if len(where_idx) == 0:
                         # 后验高度集中在少数 bin，累积和首轮即超过 ls，跳过此置信水平
                         continue
-                    thre= histc[ind[where_idx][0]]
+                    # v[k] 是"最高的 k+1 个 bin"的累积质量，所以跨过 ls 的是第 k+1 个，
+                    # 阈值高度必须取 ind[k+1]；旧写法取 ind[k]（更高一档）⇒ 集合
+                    # {histc >= thre} 是达到 ls 所需集合的真子集，报出的 68%/95%
+                    # 区间系统性偏窄。
+                    thre = histc[ind[where_idx[0] + 1]]
 
                     lv=np.min(vom[histc>=thre])
                     rv=np.max(vom[histc>=thre])
@@ -124,10 +130,18 @@ def plot2dposterior_withconf(dat, likli, indx=[], labels=[], rate=0.5,
                         else:
                             plt.plot([lv, lv], [0, max(n)], ls='dotted', color='k', linewidth=1)
                             plt.plot([rv, rv], [0, max(n)], ls='dotted', color='k', linewidth=1, label='95% CI')
-                        print(rv-par[vari], lv-par[vari])
+                        if par.size > vari:
+                            print(rv-par[vari], lv-par[vari])
                     elif ls == 0.95:
-                        print(rv)
-                        plt.plot([rv, rv], [0, max(n)], ls='solid',
+                        # 单侧 95% 上限 = 样本的 95% 分位数，不是 HPD 集合的右边界。
+                        # log_E0 在"低于巡天可探测能量"的那段后验近似平台，按 bin 高度
+                        # 排序取前 95% 等价于在平台上随机挑 bin，右界随分箱数与种子跳变。
+                        # 用 dat[:, vari] 而不是 dat[ind, vari]：ind 是开区间掩码，会把
+                        # 正好落在上下界的样本剔掉，而那恰恰是上限最该包含的点。
+                        rv95 = float(np.percentile(dat[:, vari], 95.0))
+                        print(f'{vari}-th parameter (upper_only) 95% UL = {rv95:.4f}'
+                              f'   [HPD 右界 rv={rv:.4f}，仅参考]')
+                        plt.plot([rv95, rv95], [0, max(n)], ls='solid',
                                  color='k', linewidth=2, label='95% upper')
 
             if par.size > 0 and vari not in upper_only:
@@ -151,7 +165,8 @@ def plot2dposterior_withconf(dat, likli, indx=[], labels=[], rate=0.5,
                     where_idx = np.where((v[:-1] < ls) & (v[1:]>=ls))[0]
                     if len(where_idx) == 0:
                         continue
-                    thre= histc[ind[where_idx][0]]
+                    # 同 bolupp 分支：阈值取跨越 ls 的那个 bin（ind[k+1]），不是它前一个
+                    thre = histc[ind[where_idx[0] + 1]]
 
                     lv=np.min(vom[histc>=thre])
                     rv=np.max(vom[histc>=thre])
@@ -162,7 +177,8 @@ def plot2dposterior_withconf(dat, likli, indx=[], labels=[], rate=0.5,
                     else:
                         plt.plot([lv, lv], [0, max(n)], ls='dotted', color='k', linewidth=1)
                         plt.plot([rv, rv], [0, max(n)], ls='dotted', color='k', linewidth=1, label='95% CI')
-                    print(rv-par[vari], lv-par[vari])
+                    if par.size > vari:
+                        print(rv-par[vari], lv-par[vari])
             if par.size > 0:
                 plt.plot([par[vari], par[vari]], [0, max(n)], ls='solid',
                          color='k', linewidth=2, label='MAP')
@@ -170,6 +186,8 @@ def plot2dposterior_withconf(dat, likli, indx=[], labels=[], rate=0.5,
         if truth_par is not None:
             plt.plot([truth_par[vari], truth_par[vari]], [0, max(n)], ls='dashed',
                      color='red', linewidth=2, label='injected truth')
+        # 数值不逐面板标注(实测会遮挡分布轮廓——用户反馈): MAP/true/UL95 汇总成
+        # 一张表, 与线型图例一起放左下角空三角区(见主循环外)。
 
         if len(parm) > 0:
             for i in range(len(parm)):
@@ -185,12 +203,12 @@ def plot2dposterior_withconf(dat, likli, indx=[], labels=[], rate=0.5,
             plt.plot([prior_rangedat[vari, 1]]*2, [0, max(n)], ls=':',
                      color='0.6', lw=0.8)
 
-        # --- 改进 3: 图例(只放第一个 1D 面板, 避免每个面板重复) ---
+        # 图例句柄只从第一个面板收集; 图例本体由主循环外的空三角格承载
         if vari == 0:
-            handles, lbls = plt.gca().get_legend_handles_labels()
-            if lbls:
-                plt.legend(loc='best', fontsize=14, frameon=False)
+            leg_handles, leg_labels = plt.gca().get_legend_handles_labels()
 
+        # 显式 y 上限: 直方图轮廓完整可见, 顶部留 12% 呼吸位
+        plt.ylim(0, 1.15 * float(np.max(n)))
         plt.xlim(rangedat[vari, :])
         #index of x
         for varj in range(vari + 1, npar):
@@ -221,9 +239,9 @@ def plot2dposterior_withconf(dat, likli, indx=[], labels=[], rate=0.5,
             xedges = (xedges[:-1] + xedges[1:]) / 2
             yedges = (yedges[:-1] + yedges[1:]) / 2
             mxx, mxy = np.meshgrid(xedges, yedges)
-            plt.contourf(mxx, mxy, H, 100, cmap='Blues');
-            plt.title(f"{labels[vari]}-{labels[varj]}")
-            #plt.title("%s - %s" % labels[vari] % labels[varj])
+            plt.contourf(mxx, mxy, H, 100, cmap='Blues')
+            # 无标题: 行列位置已编码参数(第 varj 列横轴/第 vari 行纵轴 = 对角线
+            # 上的 labels[varj]/labels[vari]), 文字标题只遮挡等高线(corner 惯例)
             #Prepare to count the confidence level
             indx, indy = np.meshgrid(np.arange(0, ngridx), np.arange(0, ngridy))
             vmx2 = np.squeeze(np.reshape(mxx, (-1, 1)));
@@ -251,14 +269,54 @@ def plot2dposterior_withconf(dat, likli, indx=[], labels=[], rate=0.5,
                 mxx2[vy2[ki], vx2[ki]] = vmx2[ki];
                 mxy2[vy2[ki], vx2[ki]] = vmy2[ki];
                 cmxx2[vy2[ki], vx2[ki]] = vm2[ki];
-            conls = plt.contour(mxx2, mxy2, cmxx2, levels, colors='k');
+            conls = plt.contour(mxx2, mxy2, cmxx2, levels, colors='k')
             plt.clabel(conls, inline=1, fontsize=10)
-            ax.get_yaxis().set_visible(False)
-            ax.get_xaxis().set_visible(False)
-            yloc = plt.MaxNLocator(max_yticks)
-            ax.xaxis.set_major_locator(yloc)
-            xloc = plt.MaxNLocator(max_yticks)
-            ax.yaxis.set_major_locator(xloc)
+            # 刻度【线】保留(与同行/同列 1D 面板共享标尺, 供读数对位), 数字仍
+            # 隐藏——数字只在共享边缘(对角 1D 面板)出现, corner 惯例。之前整轴
+            # set_visible(False) 连刻度线都没有, 2D 格子无法对位读数。
+            ax.xaxis.set_major_locator(plt.MaxNLocator(max_yticks))
+            ax.yaxis.set_major_locator(plt.MaxNLocator(max_yticks))
+            ax.tick_params(labelbottom=False, labelleft=False,
+                           length=3, width=0.8, color='0.5')
+
+    # 左下角【空面板三角区】放两张注记(对角线以下没有格子, 零遮挡):
+    #   底格: 线型图例; 上一格: 参数值表(MAP 列; upper_only 参数的黑线是
+    #   95% 上限, 值取 shown 样本的 95 分位)。数值逐面板标注会遮挡轮廓,
+    #   集中成表后恢复检验时一处读全。
+    if npar >= 2:
+        axl = plt.subplot(npar, npar, (npar - 1) * npar + 1)
+        axl.axis('off')
+        if leg_handles:
+            axl.legend(leg_handles, leg_labels, loc='center', fontsize=12,
+                       frameon=True, framealpha=0.9, edgecolor='0.8')
+    if npar >= 3 and (leg_handles or par.size > 0):
+        names = (list(PARAM_ORDER[:npar]) if npar <= len(PARAM_ORDER)
+                 else ['p%d' % k for k in range(npar)])
+        has_truth = truth_par is not None
+        lines = ['%-13s %9s' % ('param', 'MAP')]
+        if has_truth:
+            lines = ['%-13s %9s %9s' % ('param', 'MAP', 'true')]
+        for k in range(npar):
+            if par.size > k and k in upper_only:
+                v1 = '%.4g' % float(np.percentile(dat[:, k], 95.0))
+            elif par.size > k:
+                v1 = '%.4g' % float(par[k])
+            else:
+                v1 = '-'
+            if has_truth:
+                lines.append('%-13s %9s %9s'
+                             % (names[k], v1, '%.4g' % float(truth_par[k])))
+            else:
+                lines.append('%-13s %9s' % (names[k], v1))
+        if par.size > 0 and len(upper_only) > 0:
+            lines.append('(MAP col = 95%% UL for: %s)'
+                         % ', '.join(names[k] for k in sorted(upper_only)
+                                     if k < npar))
+        axt = plt.subplot(npar, npar, (npar - 2) * npar + 1)
+        axt.axis('off')
+        axt.text(0.0, 0.5, '\n'.join(lines), transform=axt.transAxes,
+                 ha='left', va='center', fontsize=9, family='monospace',
+                 bbox=dict(boxstyle='round,pad=0.4', fc='white', ec='0.8', alpha=0.9))
 
     # 返回实际使用的绘图范围(缩放后), 供调用方/回归测试检查
     return rangedat

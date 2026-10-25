@@ -41,7 +41,7 @@ python3 pltdatadist.py --config config_mini.json
 T0B=$(( $(date +%s) - T0B_START ))
 echo ""
 
-echo "===== Step 2/5: 生成模拟数据 (Nfrb=300, phis=1e3) ====="
+echo "===== Step 2/5: 生成模拟数据 (Nfrb=600, phis=1e3) ====="
 T1_START=$(date +%s)
 bash simudat_mini.sh
 T1=$(( $(date +%s) - T1_START ))
@@ -59,20 +59,45 @@ PID_A=$!
 bash run_samp_mini.sh &
 PID_B=$!
 
+# kill 必须打到【子进程】而不只是子壳：`bash xxx.sh &` 的 $! 是子壳 PID，子壳收到
+# SIGTERM 后它启动的 python 会被 init 收养、继续满载跑几小时（孤儿进程泄漏）。
+# run_samp_mini.sh 内部已自带 trap 转发，这里再补一层 pkill -P 双保险，覆盖
+# run_simu_mini.sh 那条前台 python（它没有 trap）。pkill 不可用时退回只 kill 子壳。
+kill_branch() {
+    pkill -P "$1" 2>/dev/null || true
+    kill "$1" 2>/dev/null || true
+    wait "$1" 2>/dev/null || true
+}
+
+# 开局体检：B（真实样本三线）若在头 60 s 内就崩（缺 dm_exc_ne2025 列、filtered.fits
+# 缺 NSAMPLE/NREF10 header 键之类的接线错误），不要傻等 A 跑完几小时才发现。
+B_DONE=0
+sleep 60
+if ! kill -0 $PID_B 2>/dev/null; then
+    if wait $PID_B; then
+        B_DONE=1        # 极少见：已经成功退出，记下免得下面重复 wait 拿到 127
+    else
+        kill_branch $PID_A
+        echo "ERROR: run_samp_mini.sh 在开局 60 s 内失败,已中止 run_simu_mini.sh" >&2
+        exit 1
+    fi
+fi
+
 # 任一失败立即 kill 另一个并退出,避免 A 失败仍阻塞等 B 跑完浪费时间
 # kill/wait 都要 || true: set -e 下它们返回非零会让脚本在打印错误信息之前就静默退出
 fail=0
 wait $PID_A || fail=1
 if [ $fail -ne 0 ]; then
-    kill $PID_B 2>/dev/null || true
-    wait $PID_B 2>/dev/null || true
+    kill_branch $PID_B
     echo "ERROR: run_simu_mini.sh 失败,已中止 run_samp_mini.sh" >&2
     exit 1
 fi
-wait $PID_B || fail=1
-if [ $fail -ne 0 ]; then
-    echo "ERROR: run_samp_mini.sh 失败" >&2
-    exit 1
+if [ "$B_DONE" -eq 0 ]; then
+    wait $PID_B || fail=1
+    if [ $fail -ne 0 ]; then
+        echo "ERROR: run_samp_mini.sh 失败" >&2
+        exit 1
+    fi
 fi
 
 T23=$(( $(date +%s) - T23_START ))
@@ -94,10 +119,9 @@ echo "===== Step 5/5: PPC (3 条线, 各 ${PPC_DRAWS} 组抽样 / ${PPC_J} 进�
 mkdir -p plots_mini/samp
 T5_START=$(date +%s)
 T5SUM=""
-for line in "ALG_NE2001:ne2001" "ALG_YMW16:ymw16" "ALG_NE2025:ne2025"
+for mw in ne2001 ymw16 ne2025
 do
-    out=$(echo $line | cut -d: -f1)
-    mw=$(echo $line | cut -d: -f2)
+    out=$(echo "$mw" | tr 'a-z' 'A-Z')
     _t0=$(date +%s)
     if python3 ppcheck.py --config config_mini.json \
             --nest ./nest_out_mini/samp/${out} -mw ${mw} \
@@ -135,7 +159,7 @@ printf "  总计                          : %s\n" "$(fmt_time $T_TOTAL)"
 echo "======================================"
 echo "手工步骤(不在本脚本内, 按需单独跑):"
 echo "  系统误差线: 同一条真实数据线加环境变量/改 config 重跑"
-echo "    CC_SURVIVAL=0.4723 sh run_samp_mini.sh   # one-off 口径存活率线 (1688/3574, 缺省全部 burst 口径 1688/4840)"
+echo "    CC_SURVIVAL=0.4639 sh run_samp_mini.sh   # one-off 口径存活率线 (1563/3369, 缺省全部 burst 口径 1563/4334)"
 echo "    config: analysis.sfr_curve=Yuksel2008    # SFR 曲线"
 echo "    config: dm_model.igm.F=0.09 / 0.5        # IGM 涨落宽度括号线(Macquart 边际化区间)"
 echo "    config: 删掉 prior_shape 段              # 平坦先验敏感度(ln Z 不可跨先验比)"

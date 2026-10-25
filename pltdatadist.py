@@ -6,8 +6,17 @@
      —— ne2025 是否"扣过头"一眼可见;
   2. 反推 DM_MW 分布（= dm_obs - dm_exc），对照 Shin 2023 的
      disk 中位 ~50 pc/cm3 与固定总值 80 pc/cm3 参考线;
-  3. dm_obs / fluence / width 样本分布;
-  4. dm_exc 模型间散点（偏离 y=x 的即为模型分歧事件）。
+  3. dm_obs / fluence / width 样本分布。fluence 与 width 不是 DM 通道的重复：
+     似然的全部输入就是 (dm_exc, fluence, width) 三元组，fluence 经 E∝F·D_L²
+     约束能量函数高端，width 同时进内禀宽度先验与选择函数（宽暴辐射计 SNR 低
+     更难探测）；fluence 低端的截止形状与 width 的量化条柱（bc_width 量化到
+     0.983 ms 整数倍）是选择函数作用的直接痕迹;
+  4. fluence-width 散点 + CHIME 辐射计阈值线 F_min(w) = S_min(w)·w（SNR=10，
+     参数取 TELESCOPES['CHIME']，与似然端 Norm1D_E/rate_2d_E 同源）：样本相对
+     选择函数的位置——低 fluence 端的截止边界应贴合阈值线，宽度维的量化结构
+     同时可见。选择函数是整条推断的命门，数据预览里值得一张专门的图。
+     （旧版此面板是 dm_exc 模型间散点：MW 模型的定量裁决已由三条推断线的
+     ln Z 横比承担——同先验可直接比，模型散点只服务人工比对，故删。）
 
 用法:
     python3 pltdatadist.py --config config_mini.json
@@ -22,7 +31,7 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-from frb_util import load_config, Loadfiles
+from frb_util import load_config, Loadfiles, TELESCOPES, Telescope
 
 
 def main():
@@ -56,6 +65,8 @@ def main():
     ax = axes[0, 0]
     bins = np.linspace(0, 1500, 75)
     for name, v, c in models:
+        # dm_exc_ne2025 若有 mwprop 失败方向会是 NaN，median/min/percentile 会整片变 nan
+        v = v[np.isfinite(v)]
         ax.hist(v, bins=bins, histtype='step', lw=1.8, density=True, color=c,
                 label=f'{name}: med={np.median(v):.0f}, neg={int(np.sum(v < 0))}')
     ax.set_xlabel('DM_exc [pc cm$^{-3}$]')
@@ -68,6 +79,7 @@ def main():
     bins = np.linspace(0, 150, 75)
     for name, v, c in models:
         dm_mw = vDM_obs - v
+        dm_mw = dm_mw[np.isfinite(dm_mw)]
         ax.hist(dm_mw, bins=bins, histtype='step', lw=1.8, density=True, color=c,
                 label=f'{name}: med={np.median(dm_mw):.0f}')
     ax.axvline(50, color='k', ls=':', lw=1.2)
@@ -109,19 +121,24 @@ def main():
     ax.set_title('Pulse width')
     ax.legend(fontsize=9)
 
-    # (1,2) 模型间 dm_exc 散点（有 ne2025 时比 ne2025 vs ymw16）
+    # (1,2) fluence-width 散点 + 辐射计阈值线：样本相对选择函数的位置
+    # （低 fluence 端的截止边界就是阈值线本身；宽度维的量化条柱同时可见）。
+    # 阈值参数取 TELESCOPES['CHIME']（sn0/g/tsys/npol/bw），与似然端同源。
     ax = axes[1, 2]
-    if vDM_ne2025 is not None:
-        x, y, xl, yl = vDM_ymw16, vDM_ne2025, 'DM_exc YMW16', 'DM_exc NE2025'
-    else:
-        x, y, xl, yl = vDM_ne2001, vDM_ymw16, 'DM_exc NE2001', 'DM_exc YMW16'
-    lim = (min(np.min(x), np.min(y)) - 20, np.percentile(np.maximum(x, y), 99.5))
-    ax.plot(lim, lim, 'k--', lw=1.0, label='y = x')
-    ax.scatter(x, y, s=6, alpha=0.35, color='C6')
-    n_off = int(np.sum(np.abs(x - y) > 0.2 * np.maximum(np.abs(x), np.abs(y))))
-    ax.set_xlabel(xl + ' [pc cm$^{-3}$]')
-    ax.set_ylabel(yl + ' [pc cm$^{-3}$]')
-    ax.set_title(f'Model spread (|Δ|>20%: {n_off})')
+    tel = TELESCOPES['CHIME']
+    fin = np.isfinite(vF) & np.isfinite(vW) & (vF > 0) & (vW > 0)
+    ax.scatter(vW[fin], vF[fin], s=6, alpha=0.35, color='C6')
+    wgrid = np.logspace(np.log10(max(vW[fin].min(), 1e-2)),
+                        np.log10(vW[fin].max() * 1.5), 200)
+    smin = Telescope().RMEq(tel['sn0'], tel['g'], tel['tsys'], tel['npol'],
+                            tel['bw'], wgrid)                 # S_min(w) [Jy]
+    ax.plot(wgrid, smin * wgrid, 'k--', lw=1.4,
+            label=f"radiometer threshold, SNR={tel['sn0']:g}")
+    ax.set_xscale('log')
+    ax.set_yscale('log')
+    ax.set_xlabel('Width [ms]')
+    ax.set_ylabel('Fluence [Jy ms]')
+    ax.set_title('Sample vs detection threshold')
     ax.legend(fontsize=9)
 
     fig.tight_layout()

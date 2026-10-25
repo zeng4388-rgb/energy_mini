@@ -224,7 +224,7 @@ class AstroDistribution:
         self._IG_NT = 20000        # t 网格点数（C0 解对 NT 不敏感：2e4~2e6 五位小数不变）
         self._IG_N_SD = 96         # 抽样主表的 ln σ_DM 网格点数
         self._IG_N_U = 1024        # 抽样主表的分位点数
-        self._ig_cache = {}        # 键 round(σ_DM,10) -> (C0, Δ升序, CDF, 累积一阶矩)
+        self._ig_node_cache = {}   # 键 (round(σ_DM,10), N_igm) -> 质心节点行 (N_igm,)
         self._ig_samp_tab = None   # (N_SD, N_U) 抽样主表，惰性构建
         self.Zmax = 5
         self.Zmin = 0.01           # 原 2e-6：σ_DM=F z^-1/2 在 z→0 发散；z<0.01 体积可忽略
@@ -232,8 +232,10 @@ class AstroDistribution:
         # NE2001 与 NE2025 均【不含晕组件】（NE2025 高银纬渐近 DM 仅由厚盘
         # n1*H1 ~ 24 pc/cm^3 给出，Ocker & Cordes 2026），故目录 dm_exc 残差中
         # 必然仍含完整银河系晕；对晕做均匀边际化，不是重复扣除。
-        # 主线保持 U[0,60]（均值 30）以便与 P0 可比；系统误差线用 [20,80]（均值 50
-        # = Z21 Fig4 取值；文献锚点 Dolag ~30 / Yamasaki 43(30-245) / P&Z 50-80）。
+        # 只此一条窗（均值 30，与 P0 可比）：均匀窗被 IntDMsrc_LogNormal 解析积掉，
+        # 不占采样维，所以"换晕窗"不需要多跑一条线。[20,80]（均值 50 = Z21 Fig4；
+        # 文献锚点 Dolag ~30 / Yamasaki 43(30-245) / P&Z 50-80）只作为 V2/V11 的
+        # 算术核查窗口存在，不是可运行的副线（CC_HALO 覆盖已删除）。
         # ⚠ 晕与 ln_mu_host 在【固定 z】处精确简并：窗口上移 Δ 等价于残差减 Δ,
         #   宿主少吸收 Δ；但晕不随 z 增长而宿主按 (1+z)^host_dm_evol 增长, 所以跨 z
         #   只是【近似】简并——补偿同一平移所需的 dln_mu_host 随 z 变化(Δ=20 时
@@ -245,11 +247,6 @@ class AstroDistribution:
         # 观测帧，不乘 (1+z)。
         self.DMsmin = 0.
         self.DMsmax = 60.
-        # Wmin/Wmax 历史上是 Norm1D_E/rate_2d_E 的固定宽度网格边界；宽度网格改为
-        # 按 (mu_w, sigma_w) 的 μ±6σ 自适应后（与模拟端同源），这两个值不再被
-        # 选择函数使用，仅作历史参考保留。
-        self.Wmax = 20
-        self.Wmin = 0.05
 
     def sigma_dm_igm(self, z):
         """σ_DM(z) = igm_F · z^(-1/2)（James §2.3 / Shin A16 下方）。
@@ -295,11 +292,15 @@ class AstroDistribution:
         return brentq(f, -40.0 * sd - 5.0, 40.0 * sd + 20.0, xtol=1e-11, rtol=1e-13)
 
     def _ig_tables(self, sd):
-        """缓存 (C0, Δ升序, CDF(Δ), 累积一阶矩 E[Δ·1{Δ<=x}])。键 round(sd,10)。"""
-        key = round(float(sd), 10)
-        hit = self._ig_cache.get(key)
-        if hit is not None:
-            return hit
+        """构建 (C0, Δ升序, CDF(Δ), 累积一阶矩 E[Δ·1{Δ<=x}]) 的 NT 点细表。
+
+        细表只在构建期存在、用完即弃：长期缓存的是它的【查询结果】——
+        igm_delta_nodes 的质心节点行（_ig_node_cache）与 _ig_sampling_table 的
+        分位行（_ig_samp_tab）。三根 NT=20000 数组 ≈ 480 KB/σ，似然网格 400 +
+        抽样 96 ≈ 496 个 σ 若按细表常驻 ≈ 240 MB/进程（run_all 四进程 ≈ 1 GB），
+        而 σ 集合固定后细表不会再被读——留存只有内存成本、没有速度收益。
+        V26 直接调本函数取全表矩作精确参照：每次重建 ~13 ms，3 次 <0.1 s，可接受。
+        """
         C0 = self._ig_solve_C0(sd)
         t, h = self._ig_tgrid(C0, sd)
         W = self._ig_pt(C0, sd, t) * h
@@ -310,15 +311,15 @@ class AstroDistribution:
         # 末层质心落错区间（实测 mean 偏 -2e-9），故必须 clip 到 [0,1]。
         cum = np.cumsum((W * D)[::-1])[::-1]          # E[Δ·1{Δ <= D_i}]
         rev = slice(None, None, -1)                   # 转为 Δ 升序（cdf/cum 随之升序）
-        out = (C0, D[rev], cdf[rev], cum[rev])
-        self._ig_cache[key] = out
-        return out
+        return (C0, D[rev], cdf[rev], cum[rev])
 
     def igm_delta_nodes(self, z):
         """(n, N_igm) 质心节点表：第 j 层质心 = N·[M(q_{j+1}) - M(q_j)]。
 
         等权平均精确重现 <Δ>=1（构造性），重尾不再丢质量。
         推断端 log_distr_efdmwz 用；与 igm_delta_sample 共用 _ig_tables。
+        质心行按 (σ_DM, N_igm) 缓存在 _ig_node_cache（细表用完即弃，见 _ig_tables）
+        ——似然 z 网格固定，第二次求值起零重建。
 
         z 按【扁平列表】解释：任意形状都先 ravel，返回 (z.size, N_igm)。
         推断端传的 z 是 (nz,1) 广播形 —— 若用 atleast_1d 而非 ravel，enumerate
@@ -330,13 +331,18 @@ class AstroDistribution:
         out = np.empty((zs.size, self.N_igm))
         e = np.arange(self.N_igm + 1) / self.N_igm
         for i, zz in enumerate(zs):
-            _, _, cdf, cum = self._ig_tables(float(self.sigma_dm_igm(zz)))
-            # 补精确端点 (0,0) 与 (1,<Δ>)：否则 np.interp 在 e=0 处 clamp 到
-            # cum[0]>0，首层质心偏小 ~2e-9。补上后各层质心望远镜相消，
-            # mean(nodes) = cum[-1] - 0 = <Δ>，严格到求积精度。
-            c_ext = np.concatenate(([0.0], cdf, [1.0]))
-            m_ext = np.concatenate(([0.0], cum, [cum[-1]]))
-            out[i] = self.N_igm * np.diff(np.interp(e, c_ext, m_ext))
+            sd = float(self.sigma_dm_igm(zz))
+            row = self._ig_node_cache.get((round(sd, 10), self.N_igm))
+            if row is None:
+                _, _, cdf, cum = self._ig_tables(sd)
+                # 补精确端点 (0,0) 与 (1,<Δ>)：否则 np.interp 在 e=0 处 clamp 到
+                # cum[0]>0，首层质心偏小 ~2e-9。补上后各层质心望远镜相消，
+                # mean(nodes) = cum[-1] - 0 = <Δ>，严格到求积精度。
+                c_ext = np.concatenate(([0.0], cdf, [1.0]))
+                m_ext = np.concatenate(([0.0], cum, [cum[-1]]))
+                row = self.N_igm * np.diff(np.interp(e, c_ext, m_ext))
+                self._ig_node_cache[(round(sd, 10), self.N_igm)] = row
+            out[i] = row
         return out
 
     def _ig_sampling_table(self):
@@ -362,25 +368,39 @@ class AstroDistribution:
     def igm_delta_sample(self, z, size, rng):
         """模拟端抽样：与 igm_delta_nodes 同一套 _ig_tables（两端单一数据源）。
 
+        z 可为标量（广播到 size）或长度 >= size 的数组；两者都不是当场报错，不做
+        静默截断（旧写法在 len(z)<size 时会在 i0[i] 处抛 IndexError）。
         rng=None 时退回全局 np.random（simufrb 的历史约定）。
+
+        内插全向量化：抽样主表的分位网格 ug=(i+0.5)/N_U 是等间距的，np.interp 的
+        两点线性内插可用二维花式索引复现且逐位相同（实测 2e4 抽样最大相对差 0.0e+00）。
+        旧 Python 逐事件循环在 smooth 模式 ns0=5e5 时每轮要调 1e6 次 np.interp
+        （实测 2e4 次 = 0.15 s ⇒ 5e5 约 3.8 s），向量化后同一批量 <10 ms。
         """
-        z = np.atleast_1d(np.asarray(z, dtype=float))
-        if rng is None:
-            u = np.random.uniform(0.0, 1.0, size)
+        z_arr = np.atleast_1d(np.asarray(z, dtype=float))
+        if z_arr.size == 1:
+            z_arr = np.broadcast_to(z_arr, (size,))
+        elif z_arr.size < size:
+            raise ValueError("igm_delta_sample: len(z)=%d < size=%d"
+                             % (z_arr.size, size))
         else:
-            u = rng.uniform(0.0, 1.0, size)
+            z_arr = z_arr[:size]
+        u = (np.random.uniform(0.0, 1.0, size) if rng is None
+             else rng.uniform(0.0, 1.0, size))
         tab, lnsd, ug = self._ig_sampling_table()
-        sd = np.clip(self.sigma_dm_igm(z[:size] if len(z) >= size else z),
-                     np.exp(lnsd[0]), np.exp(lnsd[-1]))
+        sd = np.clip(self.sigma_dm_igm(z_arr), np.exp(lnsd[0]), np.exp(lnsd[-1]))
         pos = (np.log(sd) - lnsd[0]) / (lnsd[1] - lnsd[0])
         i0 = np.clip(np.floor(pos).astype(int), 0, len(lnsd) - 2)
         fr = np.clip(pos - i0, 0.0, 1.0)
-        out = np.empty(size)
-        for i in range(size):
-            a = np.interp(u[i], ug, tab[i0[i]])
-            b = np.interp(u[i], ug, tab[i0[i] + 1])
-            out[i] = a + fr[i] * (b - a)
-        return out
+        nu = len(ug)
+        upos = u * nu - 0.5                       # ug[j] = (j+0.5)/nu 的逆映射
+        j0 = np.clip(np.floor(upos).astype(int), 0, nu - 2)
+        ufr = np.clip(upos - j0, 0.0, 1.0)
+        # 端点严格复现 np.interp 的 clamp：upos<0 取 tab[:,0]，>nu-1 取 tab[:,-1]
+        ufr = np.where(upos <= 0.0, 0.0, np.where(upos >= nu - 1.0, 1.0, ufr))
+        a = tab[i0, j0] + ufr * (tab[i0, j0 + 1] - tab[i0, j0])
+        b = tab[i0 + 1, j0] + ufr * (tab[i0 + 1, j0 + 1] - tab[i0 + 1, j0])
+        return a + fr * (b - a)
 
     def log_IntBeam(self, logl, gamma, logls, logl0):
         """波束卷积核 ∫_{E}^{2E} x^γ e^{-x} dx / ln2，写成两个上不完全伽马之差。
@@ -572,22 +592,22 @@ class AstroDistribution:
         raise ValueError("未知 sfr_curve: %r（可选 MD2014 / Yuksel2008）" % (curve,))
 
     def evolution_factor(self, z, n_evol=None):
-        """FRB 事件率宇宙学演化因子。Shin 2023 Eq.(A8) / James 2022b Eq.(13) 的原式是
+        """FRB 事件率宇宙学演化因子。Shin 2023 Eq.(A8) / James 2022b Eq.(13) 原式：
 
             Phi(z) = Phi0 * (1+z)^(-1) * [SFR(z)/SFR(0)]^n
 
-        本实现把 (1+z) 折进幂内：Phi ∝ [(SFR/SFR(0))/(1+z)]^n。两者**仅在 n=1 时
-        恒等**（V6 已证逐点相对差 <1e-12）；n≠1 时相差 (1+z)^(1-n)。
-        当前 n_evol 固定为 1.0（Shin Table 1 最佳拟合 n=0.96 在 1σ 内与 1 不可分），
-        故数值无差异。**若将来把 n 放开为自由参数，必须先改回原式**，否则 n=0 会
-        连源帧→观测帧的时间膨胀一起丢掉（先验中位 z 偏 +28.6%）。
+        (1+z)^(-1) 是源帧→观测帧的时间膨胀，属纯运动学，与"率追踪 SFH 的强度指数"
+        n 无关，故【必须留在幂次外】。旧实现把 (1+z) 折进幂内，两者仅在 n=1 时恒等，
+        n≠1 时相差 (1+z)^(1-n)（n=0 会把时间膨胀整个丢掉，先验中位 z 偏 +28.6%）；
+        已改回原式（n=1 处逐点相对差 <1e-12，V6 与全部基线不变），n_evol 现在可以
+        安全地当网格扫描参数改（config analysis.n_evol）。
         n_evol=0 -> 不随 SFH 演化；n_evol=1 -> 完美追踪 SFH。
         调用方不得再额外乘/除 (1+z)。
         """
         if n_evol is None:
             n_evol = self.n_evol
-        ratio = (self.SFR_evolution(z) / self.SFR_evolution(0.0)) / (1.0 + z)
-        return np.power(ratio, n_evol)
+        sfr_ratio = self.SFR_evolution(z) / self.SFR_evolution(0.0)
+        return np.power(sfr_ratio, n_evol) / (1.0 + np.asarray(z, dtype=float))
 
     def Distribution_volume(self, z):
         """
@@ -642,7 +662,22 @@ class AstroDistribution:
         DM 通道全程【观测帧】：残差 r = dme - DM_IGM(z) = DM_halo + DM_host^obs，
         宿主中位数取 Zhang 2020 Eq(6) 的观测帧量 A(1+z)^host_dm_evol。
         因此窗口边界不含任何 (1+z) 或 kappa 因子（雅可比恒为 1）。
+
+        ⚠ 与本项目抄的框架来源（frblf_erd / cc_energy）口径【不同】，勿照抄回去：
+        旧代码用 u1=(dme-dmi)(1+z)·κ(z)、u2=((dme-dmi)(1+z)-DMsmax)·κ(z) 把整条残差
+        搬到【源帧】，造数端同样把晕 /(1+z)（frblf_erd/simufrb.py:66 = cc_energy 同式）。
+        晕在本星系内（z≈0），不参与宇宙学时间膨胀，故此处改为观测帧直接相加；κ(z) 与
+        宿主的 √(SFR(z)/SFR(0)) 标度一并删除（宿主-红移关联改由 (1+z)^host_dm_evol 承担）。
+        z~1 时两种口径差 2 倍，按旧公式复现会得到不同的 ln_mu_host 与 log_E0。
+
+        z 契约：(nz,1) 列形或 1-D (nz,) 均可，返回 (nz, N)。1-D 在入口规范成列形
+        —— IGM 节点循环里 dmi_mean × 节点列依赖 (nz,1)：1-D z 会广播出 (nz,nz)
+        （N==nz 时静默返回错误形状，N!=nz 抛难懂的 broadcast 错；log_distr_efdmw
+        注释承诺的 z(nz,) 支持在 IGM 准高斯重写时失效，V32 钉）。标量行为不变。
         """
+        z = np.asarray(z, dtype=float)
+        if z.ndim == 1:
+            z = z[:, np.newaxis]
         flux = np.power(10., logflux)
         w_ms = np.power(10., logw)       # 脉冲宽度 [ms]
         fluence = flux * w_ms            # fluence = S * w [Jy·ms]
@@ -853,9 +888,14 @@ class EventRate:
         return rho / self.rad2deg2 / self.yr2hr
 
     def log_dis_poi(self, rho, N, Omega, T):
-        lamda = rho*Omega*T
-        ind = lamda <= 0
-        lamda[ind] = 1e-199
+        """Poisson 项对数似然。兜底改用 np.where，不再做布尔索引赋值：
+
+        旧写法对 0-d/标量输入抛 TypeError（'float' object does not support item
+        assignment），逼着三个入口脚本把 FOV/TIME/N 一律包成 1 元素数组。数组输入
+        的结果逐位不变。
+        """
+        lamda = np.asarray(rho, dtype=float) * Omega * T
+        lamda = np.where(lamda <= 0, 1e-199, lamda)
         loglik = N*np.log(lamda)-lamda-spf.gammaln(N+1)
         return loglik
 
@@ -889,13 +929,14 @@ class Loadfiles:
 
         Header 格式（# 开头）：
           #T_obs 26280.0                          ← 可选的 key-value 元数据
-          #S W T DMe thres logE Z DMi DMh DMs      ← 列名
+          #S W T DMe thres logE Z DMi DMh DMmw      ← 列名（与 simufrb.py 的 header 一致；
+            下游只读 S/W/T/DMe/Z，其余列是模拟过程留档）
 
         若 header 中包含 T_obs，则返回字典中会包含 'T_obs' 键。
         """
         col_names = None
         t_obs = None
-        with open(fname) as f:
+        with open(fname, encoding='utf-8') as f:
             for line in f:
                 stripped = line.strip()
                 if not stripped:
@@ -913,7 +954,8 @@ class Loadfiles:
         if col_names is None:
             raise ValueError(f"无法从 {fname} 的 header 中解析列名")
 
-        cat = np.loadtxt(fname, dtype=float, comments='#')
+        # atleast_2d：单事件文件会让 loadtxt 退化成 1-D，cat[:, i] 直接 IndexError
+        cat = np.atleast_2d(np.loadtxt(fname, dtype=float, comments='#', encoding='utf-8'))
         cat2 = {}
         for i, name in enumerate(col_names):
             cat2[name] = cat[:, i]
@@ -1132,14 +1174,19 @@ def apply_dm_model(dis, cfg):
     # 与固定值跑的是同一条线、同一张图，只让 ln_mu_host 的误差棒更诚实。
     # CC_HALO 环境变量覆盖已于 2026-10-09 删除（多线产出数据混乱，且晕与
     # ln_mu_host 在固定 z 处精确简并，副线提供的信息量有限）。
-    dis.igm_F = float(igm.get('F', dis.igm_F))
-    dis.igm_alpha = float(igm.get('alpha', dis.igm_alpha))
-    dis.igm_beta = float(igm.get('beta', dis.igm_beta))
-    dis.igm_zmin_eff = float(igm.get('zmin_eff', dis.igm_zmin_eff))
-    n = int(igm.get('N_nodes', dis.N_igm))
-    if n != dis.N_igm or not hasattr(dis, '_ig_cache'):
-        dis.N_igm = n
-        dis._ig_cache = {}          # 节点数/参数变了必须清空缓存，否则用旧表
+    # IGM 参数任一变化都必须同时作废【两张】缓存：_ig_node_cache 的键虽含
+    # (σ_DM, N_igm)，alpha/beta 变了键不变而行变了；_ig_sampling_table 的 ln σ
+    # 覆盖区间由 igm_F 决定，不清会把新的小 σ_DM clip 到旧下界（跑 F=0.09/0.5
+    # 括号线时高 z 事件的 IGM 宽度全错，且不报错）。
+    new = (float(igm.get('F', dis.igm_F)), float(igm.get('alpha', dis.igm_alpha)),
+           float(igm.get('beta', dis.igm_beta)),
+           float(igm.get('zmin_eff', dis.igm_zmin_eff)),
+           int(igm.get('N_nodes', dis.N_igm)))
+    old = (dis.igm_F, dis.igm_alpha, dis.igm_beta, dis.igm_zmin_eff, dis.N_igm)
+    dis.igm_F, dis.igm_alpha, dis.igm_beta, dis.igm_zmin_eff, dis.N_igm = new
+    if new != old or not hasattr(dis, '_ig_node_cache'):
+        dis._ig_node_cache = {}     # 节点数/参数变了必须清空缓存，否则用旧行
+        dis._ig_samp_tab = None
     return dis
 
 
@@ -1152,8 +1199,10 @@ def build_models(cfg):
     er 与 dis 必须共享同一个 cos：EventRate 自带独立的默认实例。
     """
     cc = cfg.get('cosmology', {})
-    cos = Cosmology(omegam=cc.get('Omega_m', 0.308), omegal=cc.get('Omega_L', 0.692),
-                    omegab=cc.get('Omega_b', 0.0484), h0=cc.get('H0', 67.81) / 100.0)
+    # 回退默认必须与 Cosmology.__init__ 的默认同一组（Planck 2018 VI）：否则 config
+    # 缺 cosmology 段时会静默退回 Planck 2015，<DM_IGM>(1) 从 902.24 漂回 895.19
+    cos = Cosmology(omegam=cc.get('Omega_m', 0.315), omegal=cc.get('Omega_L', 0.685),
+                    omegab=cc.get('Omega_b', 0.0493), h0=cc.get('H0', 67.4) / 100.0)
     dis = AstroDistribution()
     dis.cos = cos
     apply_dm_model(dis, cfg)
@@ -1189,18 +1238,18 @@ def read_selection_survival(catalog_path, mode='step'):
     失配（mock 17.2% vs 实测 7.7%，P(SNR<12|SNR>=10)，见 test_models_local
     V17），故 snr>=12 这道未做阈值化精确处理（若两估计量将来对齐可升格
     sn0=12，须 Norm1D_E/rate_2d_E/simufrb 三处同步）；scat<=10ms
-    （716/3024=23.7%，最大单项）是唯一有对称性、可原理性进入选择函数的
-    一道（tau(DM,z) 依赖探测概率），是 S 的下一轮缩水方向；dm_fitb>=100
-    实测纯 no-op；DM_MW<=100 与 notes 无对称性，只能留常数。S̄ 若将来
-    θ 依赖化，必须同步进 Norm1D_E 与 rate_2d_E，否则 S̄(θ)^N 以 N=1688
+    （736/3190=23.1%，最大单项；2026-10-11 sub_num 去重后重测）是唯一有对称性、
+    可原理性进入选择函数的一道（tau(DM,z) 依赖探测概率），是 S 的下一轮缩水方向；
+    dm_fitb>=100 实测纯 no-op；DM_MW<=100 与 notes 无对称性，只能留常数。S̄ 若将来
+    θ 依赖化，必须同步进 Norm1D_E 与 rate_2d_E，否则 S̄(θ)^N 以 N=1563
     杠杆扭曲后验。（区分 2026-10-05：本条禁的是【外部实测常数存活率】被
     做成 θ 依赖——那会让一个测量值携带 S̄(θ)^N 杠杆；选择函数 S 作为模型
     前向结构进入 Λ_S 与 C_sel（地位同 rate_2d_E 里的 IntE）是合法的
     θ 依赖，两者不冲突。）
 
-    env CC_SURVIVAL 覆盖（约定系统误差线）：0.4723 = 1688/3574 为 one-off
-    口径（one-off ∧ snr>=10 参照，杠杆 3574/4840 → 1.355×）；缺省为
-    全部 burst 口径（含重复暴 burst 计数）。
+    env CC_SURVIVAL 覆盖（约定系统误差线）：0.4639 = 1563/3369 为 one-off
+    口径（one-off ∧ snr>=10 参照，杠杆 3369/4334 → 1.287×）；缺省为
+    全部 burst 口径（含重复暴 repeater 计数）。两组数字都是 sub_num 去重后重测的。
     """
     env = os.environ.get('CC_SURVIVAL')
     if env:
@@ -1241,6 +1290,11 @@ def read_selection_survival(catalog_path, mode='step'):
     return s
 
 
+# 注入真值 JSON 的键名容忍表。当前唯一写者是 simudat_mini.sh 的 truth_file，它写的是
+# phis / gamma / logEs / logE0 / mu_w / sigma_w / ln_mu_host / ln_sigma_host —— 其余
+# 别名（phi_star、phi*、alpha=改名前的 Schechter 指数、log_Es、log_Echar、mu、sigma、
+# mu_host、sigma_host）只服务于服务器上 P0 存档时期的旧 JSON，没有任何现行写者。
+# 规矩：不再新增别名；等存档重生成后按上面的实际拼写裁剪到每参数一个键。
 _TRUTH_KEYS = {
     'log_phi0':      ('phis', 'phi_star', 'phi*'),
     'gamma':         ('gamma', 'alpha'),

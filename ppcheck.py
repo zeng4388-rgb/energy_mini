@@ -10,9 +10,9 @@
   2. 判定用统计量分位表, 不只看 spaghetti 图;
   3. 每个进程显式 default_rng(seed), 禁止依赖全局 np.random 种子。
 
-用法:
-  python3 ppcheck.py --nest ./nest_out_mini/samp/ALG_NE2025 -mw ne2025 \
-      --draws 200 -j 4 -o plots_mini/ppc_ALG_NE2025.pdf
+用法（线名 = MW 模型大写，输出路径与 run_all_mini.sh Step 5 一致）:
+  python3 ppcheck.py --nest ./nest_out_mini/samp/NE2025 -mw ne2025 \
+      --draws 200 -j 4 -o ./plots_mini/samp/NE2025_ppc.pdf
 """
 import argparse
 import multiprocessing as mp
@@ -28,8 +28,6 @@ from chime_selection import resolve_selection
 import simufrb
 from simufrb import Simu_FRBs_Eiso
 
-TEL = TELESCOPES['CHIME']
-
 
 def _stats(flu, w, dme):
     """一组统计量: 抓不同类别的模型失配。"""
@@ -41,12 +39,14 @@ def _stats(flu, w, dme):
     xs = np.sort(lf)
     sel = xs <= np.percentile(xs, 30)
     slope = np.polyfit(xs[sel], np.arange(len(xs))[sel] / len(xs), 1)[0] if sel.sum() > 10 else np.nan
-    rho = spearmanr(dme, lf).statistic
+    # [0] 而不是 .statistic：.statistic 自 SciPy 1.9 才有，下标写法全版本通用
+    rho = spearmanr(dme, lf)[0]
     # 分宽度层的流量比：平滑选择函数的 F_50(w) 只由宽度控制，这两个量是它唯一的
     # 直接检验。此前 _stats 收了 w 却从不用，而 round-1 最大的已知偏差（冻结 τ、
     # 以及对窄/宽尾的相对选错）恰好全在宽度维上，现有统计量对它完全失明。
     # 分层边界不是随手取的：目录 width 列是 bc_width（preprocess_catalog.py:102），
-    # 它是【搜索箱宽】，量化到 0.983 ms 采样的整数倍 —— 实测 1688 样本只有 42 个
+    # 它是【搜索箱宽】，量化到 0.983 ms 采样的整数倍 —— 实测 1563 样本（2026-10-11
+    # sub_num 去重后）只有 42 个离散档，52.5% 挤在 1.966 ms
     # 离散值，49.4% 挤在 1.966 ms（p5–p50 全为它；p1=0.983、p75=4.915，2026-10-05
     # 复核修正，旧注释"p1..p75 全 1.966/75%"有误）。边界落在空箱（如 <0.983 ms）
     # 会选出空层并把本统计量变成 NaN（进而在秩检验里报成 0% 假阳性）。边界必须
@@ -66,16 +66,19 @@ NAMES = ["DM_EG p10", "p25", "p50", "p75", "p90",
 
 
 def _one_draw(task):
-    seed, params, ns, fov, survival, sel_mode, sel_k = task
+    seed, params, ns, svy, survival, sel_mode, sel_k = task
     rng = np.random.default_rng(seed)          # 规则 3: 显式种子
     np.random.seed(seed % (2 ** 32 - 1))       # simufrb 内部仍用全局接口, 逐进程隔离
     phis, gamma, logEs, logE0, mu_w, sig_w, mu_h, sig_h = params
     # post_equal_weights 第 0 列已是先验变换后的【线性】 phis（prior_transform 对
     # log_phi0 返回 10**(lo+u*(hi-lo))；pltpost 对它取 log10 也反证）。
     # 原来写 10.0**phis 会溢出成 inf → lamda=inf → 到达时间列被静默写成全 0。
+    # 望远镜参数走 svy 字典（tel_svy.txt + config.analysis.dnu），与两个采样入口
+    # 同源；曾经这里硬编码 TELESCOPES['CHIME']，改 config 的 dnu 或 tel_svy 的
+    # SN0/Tsys 时 PPC 会与似然端悄悄分家。
     res = Simu_FRBs_Eiso(phis, gamma, logEs, logE0, mu_w, sig_w,
-                         dnu=TEL['dnu'], ns=ns, fov=fov, npol=TEL['npol'],
-                         g=TEL['g'], tsys=TEL['tsys'], bw=TEL['bw'], sn0=TEL['sn0'],
+                         dnu=svy['dnu'], ns=ns, fov=svy['fov'], npol=svy['npol'],
+                         g=svy['g'], tsys=svy['tsys'], bw=svy['bw'], sn0=svy['sn0'],
                          ln_mu_host=mu_h, ln_sigma_host=sig_h,
                          poisson_survival=survival,
                          sel_mode=sel_mode, sel_k=sel_k)
@@ -92,7 +95,7 @@ def _one_draw(task):
 
 def _init_worker(config_path):
     """Pool worker 初始化：fork 下其实已继承，但 Windows/spawn 下子进程会重新
-    import simufrb 拿到【默认】模型参数（晕窗/σ_ln/宇宙学全丢），
+    import simufrb 拿到【默认】模型参数（dm_model 的晕窗/IGM/宿主演化 + 宇宙学全丢），
     所以必须显式在每个 worker 里按 config 重新接线。"""
     simufrb.cos, simufrb.dis, simufrb.er = build_models(load_config(config_path))
 
@@ -100,7 +103,8 @@ def _init_worker(config_path):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--nest", required=True, help="MultiNest 输出前缀")
-    ap.add_argument("-mw", default="ne2001", choices=["ne2001", "ymw16", "ne2025"])
+    ap.add_argument("-mw", required=True, choices=["ne2001", "ymw16", "ne2025"],
+                    help="与待检验的那条采样线取同一列 dm_exc_<模型>")
     ap.add_argument("--draws", type=int, default=200)
     ap.add_argument("-j", type=int, default=1)
     ap.add_argument("-o", required=True, help="输出 PDF")
@@ -113,7 +117,8 @@ def main():
     # apply 到临时实例上（死码）。
     simufrb.cos, simufrb.dis, simufrb.er = build_models(cfg)
 
-    post = np.loadtxt(args.nest.rstrip("/") + "post_equal_weights.dat")
+    # ndmin=2：后验只有 1 行时 loadtxt 会退化成 1-D，post[:, :8] 直接 IndexError
+    post = np.atleast_2d(np.loadtxt(args.nest.rstrip("/") + "post_equal_weights.dat"))
     params = post[:, :len(PARAM_ORDER)]
     rng = np.random.default_rng(0)
     idx = rng.choice(len(params), size=min(args.draws, len(params)), replace=False)
@@ -128,9 +133,16 @@ def main():
     # 走 Loadfiles.LoadSvyInfo（按列名取, 与推断/模拟端同一入口）。
     # 原先手工 np.loadtxt + skiprows=1 有两个错：tel_svy.txt 只有一行数据时退化
     # 成 1-D 数组使 svy[:,0] 抛 IndexError；且列号 4 是 Tsys 而不是 FOV。
+    # 这里把 PPC 需要的【全部】望远镜量都从 tel_svy.txt 取（dnu 从 config 取），
+    # 与 nest_samp_mini/nest_simu_mini 同源；曾经只取 FOV，其余五项硬编码
+    # TELESCOPES['CHIME']，改 config/tel_svy 做敏感性时 PPC 会与似然端分家。
     svy = Loadfiles().LoadSvyInfo(cfg["data"]["survey_info_path"])
-    fov = float(svy["FOV"][np.where(np.array(svy["SURVEY"]) == "CHIME")[0][0]])
-    print(f"[ppc] CHIME FOV = {fov} deg^2")
+    i_ch = int(np.where(np.array(svy["SURVEY"]) == "CHIME")[0][0])
+    svy_par = {'fov': float(svy["FOV"][i_ch]), 'sn0': float(svy["SN0"][i_ch]),
+               'g': float(svy["Gain"][i_ch]), 'tsys': float(svy["Tsys"][i_ch]),
+               'npol': float(svy["Npol"][i_ch]), 'bw': float(svy["BW"][i_ch]),
+               'dnu': float(cfg.get('analysis', {}).get('dnu', TELESCOPES['CHIME']['dnu']))}
+    print(f"[ppc] CHIME 参数(tel_svy.txt + config.analysis.dnu) = {svy_par}")
     # mock 与真实样本必须同一选择定义：模式只来自 config/env，不接受隐式默认
     sel_mode, sel_k = resolve_selection(cfg)
     print(f"[ppc] selection mode = {sel_mode}, k_offset = {sel_k}")
@@ -138,7 +150,7 @@ def main():
     survival = read_selection_survival(cfg["data"]["catalog_path"], mode=sel_mode)
 
     real = _stats(flu_real, w_real, dme_real)
-    tasks = [(1000 + i, params[i], ns, fov, survival, sel_mode, sel_k) for i in idx]
+    tasks = [(1000 + i, params[i], ns, svy_par, survival, sel_mode, sel_k) for i in idx]
     if args.j > 1:
         with mp.Pool(args.j, initializer=_init_worker, initargs=(args.config,)) as pool:
             out = pool.map(_one_draw, tasks)

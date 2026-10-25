@@ -230,12 +230,20 @@ def compute_dm_exc_ne2025(result, dist_kpc, nproc=1):
     except ImportError:
         raise ImportError("需要官方包 mwprop: pip install mwprop；"
                           "或加 --skip-ne2025 跳过此列")
-    result['dm_exc_ne2025'] = result['dm_obs'] - dm_mw
+    # NaN 一律不许落盘：写进 filtered.fits 之后，frb_util.IntDMsrc_LogNormal 里
+    # np.maximum(nan, 1e-12) 仍是 nan，log_distr_efdmwz 的 np.where(tot>0, ..., -1e30)
+    # 把它变成 -1e30 ⇒ 整条 -mw ne2025 线退化成常数平台（采样器照常"收敛"出一个
+    # 平坦后验，日志上看不出异常，V27 钉的就是这类静默失败），pltdatadist / ppcheck
+    # 也会吐 NaN。宁可当场停，也不要产出一个看着正常的坏样本。
     if n_fail > 0:
         bad = ~np.isfinite(dm_mw)
         names = ', '.join(str(s) for s in result['name'][bad][:10])
-        print(f"[warn] NE2025 计算失败 {n_fail} 个事件（置 NaN）: {names}"
-              + (" ..." if n_fail > 10 else ""))
+        raise RuntimeError(
+            f"NE2025 在 {n_fail} 个方向上计算失败（{names}"
+            + (" ..." if n_fail > 10 else "")
+            + "）；拒绝把 NaN 写入 filtered.fits。请检查 gl/gb 输入与 mwprop 版本"
+              "（--verify-dist 可做 50/100/150 kpc 平台验证）")
+    result['dm_exc_ne2025'] = result['dm_obs'] - dm_mw
     ok = np.isfinite(dm_mw)
     if ok.any():
         print(f"  DM_MW,NE2025 [pc/cm3]: min={np.min(dm_mw[ok]):.1f} "
@@ -255,6 +263,10 @@ def save_fits(result, fname, extra_header=None):
     for key in result:
         if result[key].dtype.kind in ('U', 'S'):
             # 字符串列：使用最大长度避免截断
+            if len(result[key]) == 0:
+                raise ValueError(
+                    f"列 '{key}' 为空——筛选后样本为 0，无法确定字符串列宽"
+                    f"（旧行为是在 max(len(s) for s in ...) 上抛 'max() arg is an empty sequence'）")
             max_len = max(len(s) for s in result[key])
             col = fits.Column(name=key, format=f'{max_len}A', array=result[key])
         else:
@@ -272,30 +284,6 @@ def save_fits(result, fname, extra_header=None):
     hdul = fits.HDUList([fits.PrimaryHDU(), hdu])
     hdul.writeto(fname, overwrite=True)
     print(f"  FITS: {fname}")
-
-
-def save_txt(result, fname):
-    """保存为 TXT 格式（空格分隔，首行为列名）"""
-    keys = list(result.keys())
-    header = ' '.join(keys)
-
-    # 分离字符串列和数值列
-    str_keys = [k for k in keys if result[k].dtype.kind in ('U', 'S', 'O')]
-    num_keys = [k for k in keys if result[k].dtype.kind not in ('U', 'S', 'O')]
-
-    # 用混合格式写入
-    with open(fname, 'w') as f:
-        f.write(f'# {header}\n')
-        for i in range(len(result[keys[0]])):
-            parts = []
-            for k in keys:
-                val = result[k][i]
-                if k in str_keys:
-                    parts.append(str(val))
-                else:
-                    parts.append(f'{float(val):.6f}')
-            f.write(' '.join(parts) + '\n')
-    print(f"  TXT:  {fname}")
 
 
 def print_summary(result):
@@ -335,9 +323,30 @@ if __name__ == '__main__':
     print(f"\n[1/6] 加载原始数据: {args.input}")
     data, col_names = load_raw_catalog(args.input)
 
+    # Cat2 里一个暴若有多个子暴，会有 sub_num = 0..k 的多行，而我们提取的所有物理列
+    # （fluence / bc_width / dm_fitb / dm_exc_* / snr_fitb / scat_time）在这些行上
+    # 【完全相同】（实测 FRB20200116B 的 9 行九个字段逐位一样，只有 sub_num 递增），
+    # 且这类行的 repeater_name 为空 ⇒ 原样通过 filter_minimum 的 one-off 判据。
+    # 未去重的后果（实测）：filtered.fits 1688 行里只有 1563 个唯一 tns_name，
+    # 94 个暴重复（73 个 2 次 / 16 个 3 次 / 4 个 4 次 / 1 个 9 次），多出 125 行；
+    # 逐事件似然 np.sum(log p) 把它们当独立样本 ⇒ FRB20200116B（snr=242，最亮端）
+    # 独得 9 倍权重，系统性拉偏 gamma / mu_w / sigma_w / 宿主后验；
+    # 同时 NREF10 4840→4334、NSNR12 4529→4024、NSAMPLE 1688→1563，
+    # SURVIV 0.34876→0.36063（+3.4%），Poisson 项与 φ0 的脊一起平移。
+    if 'sub_num' in col_names:
+        sub_ok = np.asarray(data['sub_num'], dtype=int) == 0
+        n_drop = int(len(data) - sub_ok.sum())
+        print(f"  去重多子暴组件(只留 sub_num==0): {len(data)} → {int(sub_ok.sum())} 行独立暴"
+              f"（剔除 {n_drop} 行子暴记录）")
+        if n_drop == 0:
+            raise RuntimeError("sub_num 列存在却没有一行 >0，列含义可能已变，请核对目录版本")
+        data = data[sub_ok]
+    else:
+        raise KeyError(f"目录缺 sub_num 列，无法去重多子暴（可用列: {list(col_names)[:20]}...）")
+
     # 选择函数参考计数（泊松项存活率 SURVIV 的分母族，写入 FITS header）：
-    # NREF10 = 全部行中 snr_fitb>=10 的行数——rate_2d_E(sn0=10) 模型检出的
-    # 目录对应物（含重复暴 burst；snr_fitb NaN 不计）。其余计数存档备查。
+    # NREF10 = 独立暴中 snr_fitb>=10 的行数——rate_2d_E(sn0=10) 模型检出的
+    # 目录对应物（含重复暴 repeater；snr_fitb NaN 不计）。其余计数存档备查。
     snr_raw = np.array(data['snr_fitb'], dtype=float)
     fin_raw = np.isfinite(snr_raw)
     n_burst = len(data)
@@ -391,7 +400,6 @@ if __name__ == '__main__':
     print("\n最终输出数据:")
     print_summary(result)
     fits_out = args.output + '.fits'
-    txt_out = args.output + '.txt'
     Path(fits_out).parent.mkdir(parents=True, exist_ok=True)
     # 泊松项/到达率的样本存活率（rate_2d_E 只含辐射计阈值，六道筛靠此因子
     # 进入似然；覆盖范围说明见 frb_util.read_selection_survival）
@@ -402,7 +410,6 @@ if __name__ == '__main__':
     print(f"  泊松项存活率 SURVIV = {n_sample/n_ref10:.4f} (= {n_sample}/{n_ref10}; "
           f"NMINFLT={n_minflt}, NSNR12={n_snr12}, NBURST={n_burst})")
     save_fits(result, fits_out, extra_header=extra_header)
-    save_txt(result, txt_out)
 
     print(f"\n完成！分析代码使用预处理后的数据:")
     print(f'  config.json: "catalog_path": "{fits_out}"')

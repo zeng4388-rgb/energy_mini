@@ -10,7 +10,6 @@ from frb_util import *
 dis = AstroDistribution()
 cos = Cosmology()
 er = EventRate()
-tel = Telescope()
 lf = Loadfiles()
 
 dnu = 1000.0  # 能量定义参考带宽，__main__ 中从 config 更新
@@ -82,15 +81,15 @@ if __name__ == '__main__':
                         help='Input FRB catalog file (txt or fits)')
     parser.add_argument('-fs', action='store', dest='fsvy', type=str,
                         help='Input Survey Information file')
-    parser.add_argument('-o', action='store', dest='fout', type=str,
-                        help='Output file basename')
-    parser.add_argument('-g', action='store', dest='fgt', type=str, default=None,
-                        help='仅用于未给 -mw 时推断 MW 模型(后缀 NE2001/YMW16); 宿主模型已统一为对数正态')
+    parser.add_argument('-o', action='store', dest='fout', type=str, required=True,
+                        help='Output file basename（MultiNest 直接在其后拼 post_equal_weights.dat，'
+                             '无分隔符；必填 ⇒ 缺名当场报错，不会白跑完 sanity check）')
     parser.add_argument('--fits', action='store_true', dest='use_fits',
                         help='Load catalog from FITS file instead of txt')
-    parser.add_argument('-mw', action='store', dest='mwmodel', type=str, default=None,
-                        help='Milky Way electron density model: ne2001 / ymw16 / ne2025'
-                             ' (default: inferred from -g suffix, keeps old behavior)')
+    parser.add_argument('-mw', action='store', dest='mwmodel', type=str, required=True,
+                        choices=['ne2001', 'ymw16', 'ne2025'],
+                        help='三条推断线之一：河外 DM 取对应的 dm_exc_<模型> 列。'
+                             '宿主(对数正态)/IGM(准高斯)/晕(均匀窗)模型三线完全共用')
     parser.add_argument('--config', action='store', dest='config_path', type=str,
                         default='config_mini.json', help='Path to config.json')
 
@@ -99,9 +98,7 @@ if __name__ == '__main__':
     fcat = args.fcat
     fsvy = args.fsvy
     fout = args.fout
-    fgt = args.fgt
     use_fits = args.use_fits
-    mwmodel = args.mwmodel
 
     # 加载全局配置
     config = load_config(args.config_path)
@@ -129,22 +126,22 @@ if __name__ == '__main__':
             f"遗留 TXT 加载路径已移除（LoadCatalogue 的列约定与 preprocess 输出不兼容）。"
             f"请改用 FITS：--fits 或把 config 的 catalog_path 指向 .fits（{fcat}）")
 
-    # MW 模型选择（与 -g 宿主星系类型解耦；未指定 -mw 时按 -g 后缀推断，保持旧行为）
-    if mwmodel is None:
-        mwmodel = 'ne2001' if (fgt and fgt.find('NE2001') >= 0) else 'ymw16'
-    mwmodel = mwmodel.lower()
-    if mwmodel == 'ne2001':
-        vDME = vDM_ne2001   # 已经是 DM_obs - DM_MW(NE2001)
-    elif mwmodel == 'ymw16':
-        vDME = vDM_ymw16    # 已经是 DM_obs - DM_MW(YMW16)
-    elif mwmodel == 'ne2025':
-        if vDM_ne2025 is None:
-            raise ValueError("filtered.fits 无 dm_exc_ne2025 列: "
-                             "先在服务器跑 preprocess_catalog.py（勿加 --skip-ne2025）")
-        vDME = vDM_ne2025   # DM_obs - DM_MW(NE2025, mwprop 预计算)
-    else:
-        raise ValueError(f"未知 MW 模型: {mwmodel}（可选 ne2001 / ymw16 / ne2025）")
-    print(f'[samp] MW model = {mwmodel} (宿主模型: 观测帧对数正态, 8 维)')
+    # 三条推断线之间唯一的差别就是这一列选择（dm_exc = DM_obs - DM_MW(<模型>)，
+    # ISM/厚盘由目录扣除，晕不在其中 → 仍走 U[DMsmin,DMsmax] 均匀边际化）。
+    # 宿主 DM 已是第 7/8 维自由参数，不再按星系类型或 MW 模型分组标定，所以线间
+    # 差异是纯 MW 效应，三条线的 ln Z 可以直接横比。
+    vDME = {'ne2001': vDM_ne2001, 'ymw16': vDM_ymw16, 'ne2025': vDM_ne2025}[args.mwmodel]
+    if vDME is None:
+        raise ValueError("filtered.fits 无 dm_exc_ne2025 列: "
+                         "先在服务器跑 preprocess_catalog.py（勿加 --skip-ne2025）")
+    # NaN/Inf 一律当场炸：NaN 进 IntDMsrc_LogNormal 后 np.maximum 仍是 NaN，最后被
+    # log_distr_efdmw 的 np.where(tot>0,...,-1e30) 吞成常数平台，采样器照样"收敛"
+    # 出一个平坦后验（V27 钉的就是这类静默失败）。
+    if not np.all(np.isfinite(vDME)):
+        n_bad = int(np.sum(~np.isfinite(vDME)))
+        raise ValueError(f"dm_exc_{args.mwmodel} 有 {n_bad} 个非有限值(NaN/Inf)，"
+                         f"禁止带入似然；重跑 preprocess_catalog.py 并检查 NE2025 是否失败")
+    print(f'[samp] MW model = {args.mwmodel} (宿主对数正态 + IGM 准高斯 + 晕均匀窗, 8 维)')
 
     print(f'[samp] 加载 {len(vLOGF)} 个已筛查 FRB（one-off，含 fluence）')
 
@@ -171,19 +168,23 @@ if __name__ == '__main__':
     vTime = np.array([float(svy_info['TIME'][i])])
     vN = np.array([float(len(vLOGF))])
 
-    # 先验范围（从 config.json 读取）
+    # 先验范围（从 config.json 读取）。名字刻意不叫 vpara/vparb：已删除的宿主
+    # 标定参数组就叫 vpar_*，同根命名会让人以为那套标定还在（2026-10-11 改名）。
     cfg = config['prior']
-    vpara = np.array([cfg[k][0] for k in PARAM_ORDER])
-    vparb = np.array([cfg[k][1] for k in PARAM_ORDER])
+    par_lo = np.array([cfg[k][0] for k in PARAM_ORDER])
+    par_hi = np.array([cfg[k][1] for k in PARAM_ORDER])
 
     print('------------par range-----------')
-    print('lower:', vpara)
-    print('upper:', vparb)
+    print('lower:', par_lo)
+    print('upper:', par_hi)
     a1 = time.perf_counter()
-    # sanity check：通过 myprior 变换后再求似然（vpara[0] 是 log_phi0，不能直送 lnlik）
-    cube_test = np.zeros(len(vpara))
-    myprior(cube_test, len(vpara), len(vpara))
-    print(myloglike(cube_test, len(vpara), len(vpara)))
+    # sanity check 取先验盒【中心】u=0.5：u=0 是盒子角点（γ=-4, σ_w=0.01,
+    # ln_sigma_host=0.2），实测每个事件都返回 -1e30 ⇒ 打印出来的 -1.688e+33 不携带
+    # 任何信息，白跑 10 s。中心点给的是一个可读的有限值，能真正当 smoke test 用。
+    # （通过 myprior 变换后再求似然：par_lo[0] 是 log_phi0，不能直送 lnlik）
+    cube_test = np.full(len(par_lo), 0.5)
+    myprior(cube_test, len(par_lo), len(par_lo))
+    print('lnlik @ 先验盒中心 =', myloglike(cube_test, len(par_lo), len(par_lo)))
     a2 = time.perf_counter()
     print(f'Single eval time: {a2-a1:.3f}s')
     print("Running Nest Sampling ...")
@@ -191,7 +192,7 @@ if __name__ == '__main__':
     import os
     output_dir = config['output']['nest_out_dir'] + 'samp/'
     os.makedirs(output_dir, exist_ok=True)
-    pymultinest.run(myloglike, myprior, len(vpara),
+    pymultinest.run(myloglike, myprior, len(par_lo),
                     importance_nested_sampling=False,
                     resume=False,
                     verbose=True,

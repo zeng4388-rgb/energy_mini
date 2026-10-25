@@ -70,10 +70,12 @@ def myloglike(cube, ndim, nparams):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='E_iso Measurements Program for Simulated FRBs')
-    parser.add_argument('-f1', action='store', dest='simu1', type=str, help='Input simulation data file')
+    parser.add_argument('-f1', action='store', dest='simu1', type=str, required=True,
+                        help='Input simulation data file (simufrb.py 的产物)')
     parser.add_argument('-fs', action='store', dest='fsvy', type=str,
                         help='Survey info file (default: from config)')
-    parser.add_argument('-o', action='store', dest='fout', type=str, help='Output file basename')
+    parser.add_argument('-o', action='store', dest='fout', type=str, required=True,
+                        help='Output file basename（MultiNest 直接在其后拼 post_equal_weights.dat）')
     parser.add_argument('--config', action='store', dest='config_path', type=str,
                         default='config_mini.json', help='Path to config file')
     args = parser.parse_args()
@@ -91,26 +93,33 @@ if __name__ == '__main__':
     SURVIVAL = read_selection_survival(config['data']['catalog_path'], mode=dis.sel_mode)
 
     # 从 tel_svy.txt 读取 CHIME 望远镜参数，覆盖模块级硬编码值
-    # （保证与 nest_samp_mini.py / simufrb.py 用同一套参数源）
+    # （保证与 nest_samp_mini.py / simufrb.py 用同一套参数源；缺 CHIME 当场报错，
+    #  与 nest_samp_mini.py 一致——静默回退默认值会让模拟线与真实线用不同口径）
     fsvy = args.fsvy if args.fsvy else config['data']['survey_info_path']
     svy_info = lf.LoadSvyInfo(fsvy)
     survey_names = list(svy_info['SURVEY'])
-    if 'CHIME' in survey_names:
-        idx = survey_names.index('CHIME')
-        g = float(svy_info['Gain'][idx])
-        bw = float(svy_info['BW'][idx])
-        tsys = float(svy_info['Tsys'][idx])
-        fov = float(svy_info['FOV'][idx])
-        npol = float(svy_info['Npol'][idx])
-        sn0 = float(svy_info['SN0'][idx])
-    else:
-        print(f'[warn] tel_svy.txt 中未找到 CHIME，回退到 TELESCOPES 默认值')
+    if 'CHIME' not in survey_names:
+        raise ValueError(f"{fsvy} 中未找到 CHIME 行（本项目只支持单巡天）")
+    idx = survey_names.index('CHIME')
+    g = float(svy_info['Gain'][idx])
+    bw = float(svy_info['BW'][idx])
+    tsys = float(svy_info['Tsys'][idx])
+    fov = float(svy_info['FOV'][idx])
+    npol = float(svy_info['Npol'][idx])
+    sn0 = float(svy_info['SN0'][idx])
 
     cat = lf.LoadSimuData(simu1)
     vLOGFLUX = np.log10(cat['S'])
     vLOGW = np.log10(cat['W'])
     vDME = cat['DMe']
     vdT = cat['T']
+    # 与 nest_samp_mini 同一道护栏：mock 里的 NaN/Inf（simufrb 被 max_iter 截断留零行、
+    # 或注入参数非法）会在 log_distr_efdmw 里被吞成 -1e30，注入-恢复整轮作废而日志
+    # 看不出来（V27 钉的就是这类静默平台）。
+    for _name, _arr in (('S', cat['S']), ('W', cat['W']), ('DMe', vDME), ('T', vdT)):
+        _bad = int(np.sum(~np.isfinite(_arr)))
+        if _bad:
+            raise ValueError(f"{simu1} 的 {_name} 列含 {_bad} 个非有限值(NaN/Inf)")
     vN = np.array([len(vLOGFLUX)])
     vFOV = np.array([fov])
     # 模拟数据的观测时长必须用 sum(vT)：模拟器固定生成 ns 个事件，
@@ -120,27 +129,29 @@ if __name__ == '__main__':
     # 约 T_obs/sum(vT) 倍（可达 3+ 个量级），truth 线飞出 posterior 范围。
     vT = np.array([np.sum(vdT)])
 
-    # 先验范围（从 config 读取）
+    # 先验范围（从 config 读取）。名字刻意不叫 vpara/vparb：已删除的宿主标定参数组
+    # 就叫 vpar_*，同根命名会让人以为那套标定还在（2026-10-11 与 nest_samp 同步改名）。
     cfg = config['prior']
-    vpara = np.array([cfg[k][0] for k in PARAM_ORDER])
-    vparb = np.array([cfg[k][1] for k in PARAM_ORDER])
+    par_lo = np.array([cfg[k][0] for k in PARAM_ORDER])
+    par_hi = np.array([cfg[k][1] for k in PARAM_ORDER])
 
     print('------------par range-----------')
-    print('lower:', vpara)
-    print('upper:', vparb)
+    print('lower:', par_lo)
+    print('upper:', par_hi)
     print(f'CHIME params: g={g}, bw={bw}, tsys={tsys}, fov={fov}, dnu={dnu}')
     a1 = time.perf_counter()
-    # sanity check：通过 myprior 变换后再求似然（vpara[0] 是 log_phi0，不能直送 lnlik）
-    cube_test = np.zeros(len(vpara))
-    myprior(cube_test, len(vpara), len(vpara))
-    print(myloglike(cube_test, len(vpara), len(vpara)))
+    # sanity check 取先验盒【中心】u=0.5（u=0 是角点 γ=-4/σ_w=0.01，实测每个事件都
+    # 返回 -1e30，打印值不携带信息）。注入-恢复看的就是这个数字是否有限且可读。
+    cube_test = np.full(len(par_lo), 0.5)
+    myprior(cube_test, len(par_lo), len(par_lo))
+    print('lnlik @ 先验盒中心 =', myloglike(cube_test, len(par_lo), len(par_lo)))
     a2 = time.perf_counter()
     print(f'Single eval time: {a2-a1:.3f}s')
     print("Running Nest Sampling ...")
     import os
     output_dir = config['output']['nest_out_dir'] + 'simu/'
     os.makedirs(output_dir, exist_ok=True)
-    pymultinest.run(myloglike, myprior, len(vpara),
+    pymultinest.run(myloglike, myprior, len(par_lo),
                     importance_nested_sampling=False,
                     resume=False,
                     verbose=True,
