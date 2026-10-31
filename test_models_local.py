@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""本地模型层验证套件 V1-V33（不需要 pymultinest / mwprop / P0 存档）。
+"""本地模型层验证套件 V1-V38（不需要 pymultinest / mwprop / P0 存档）。
 
 对应《代码改进方案.md》C11。全部为 assert 形式，任何一条失败即退出非零。
 用法:  python3 test_models_local.py
@@ -269,7 +269,7 @@ def v8_prior_shape():
     lo, hi = cfg["prior"]["ln_sigma_host"]
     assert v.min() >= lo and v.max() <= hi, (v.min(), v.max())
     mu = float(cfg["prior_shape"]["ln_sigma_host"]["mu"])
-    # 截断不对称（下截在 -1.58σ、上截在 +4.4σ）会把中位数上移 ~0.03，
+    # 截断不对称（下截在 -1.80σ、上截在 +4.37σ）会把中位数上移 ~0.02，
     # 所以容差 0.06 而不是 0.02；断言的目的是"形状生效"，不是"中位数=mu"。
     assert abs(np.median(v) - mu) < 0.06, np.median(v)
     # 未指定形状的参数必须是均匀映射
@@ -550,15 +550,11 @@ def v16_plot_zoom_and_smooth():
     2D 高斯平滑。合成链(不依赖 MultiNest 输出), 只验证范围逻辑与出图不崩;
     平滑为纯显示质量改动, 此处仅烟测。
 
-    本地无 pymultinest 时打桩: pltpost 模块级 import 它但绘图函数不使用。
+    工程2 后 pltpost 不再依赖 pymultinest（Analyzer 已换 np.loadtxt），
+    本地直接 import 即可，无需打桩。
     """
-    import types
     import matplotlib
     matplotlib.use('Agg')
-    try:
-        import pymultinest
-    except ImportError:
-        sys.modules['pymultinest'] = types.ModuleType('pymultinest')
     from pltpost import plot2dposterior_withconf
     import matplotlib.pyplot as plt
 
@@ -1513,6 +1509,233 @@ def v33_mock_and_pz_determinism():
           " med(z_med-z_true); 页1 确定性选样钉住")
 
 
+def v34_llfail_guard_counts_and_breaks():
+    """A1 钉: -1e30 哨兵必须计数、flush 打印、到阈值熔断; 熔断出口可注入。
+
+    背景: 旧 lnlik 的 except/isfinite 分支无计数无阈值, V27 那类"似然变常数平台"
+    再出现时 MultiNest 照样收敛出平坦后验。os._exit 是默认出口, 测试里注入记录器,
+    否则会把测试进程自己杀掉。
+    """
+    from frb_util import LlfailGuard
+    exits = []
+    g = LlfailGuard(threshold=3, exit_func=lambda c: exits.append(c))
+    v = np.array([1.0e3, -1.5, 43.4, 38.4, 0.4, 0.3, 3.5, 1.0])
+    for _ in range(2):
+        g.note_eval()
+        assert g.fail(v, ValueError('boom')) == -1e30
+    assert (g.n_eval, g.n_fail) == (2, 2) and exits == []
+    g.note_eval()
+    assert g.fail(v) == -1e30          # isfinite 兜底走同一个计数器(无 exc)
+    assert exits == [2], exits         # 熔断: 退出码 2
+    assert g.n_fail == 3
+    g0 = LlfailGuard(threshold=0, exit_func=lambda c: exits.append(c))
+    for _ in range(5):
+        g0.note_eval()
+        assert g0.fail(v) == -1e30
+    assert g0.n_fail == 5 and exits == [2], "CC_LLFAIL_MAX=0 必须是禁用熔断, 不是第 1 次就断"
+    import os
+    old = os.environ.get('CC_LLFAIL_MAX')
+    os.environ['CC_LLFAIL_MAX'] = '7'
+    try:
+        assert LlfailGuard().threshold == 7
+    finally:
+        if old is None:
+            os.environ.pop('CC_LLFAIL_MAX', None)
+        else:
+            os.environ['CC_LLFAIL_MAX'] = old
+    # summarize_every ≤0 必须钳到 1（2026-10-31 外审钉）：0 会让 fail() 的取模在
+    # 越过 trace_cap 后除零（实测第 11 次失败即炸），guard 不得自己成为新死法。
+    for bad in (0, -100):
+        gbad = LlfailGuard(threshold=0, summarize_every=bad,
+                           exit_func=lambda c: exits.append(c))
+        assert gbad.summarize_every == 1, (bad, gbad.summarize_every)
+        for _ in range(12):                 # 第 11 次正是旧代码的除零点
+            gbad.note_eval()
+            assert gbad.fail(v) == -1e30
+    # 两个采样入口必须真的接了护栏, 且旧的裸 -1e30 返回已删除
+    for fn in ("nest_samp_mini.py", "nest_simu_mini.py"):
+        src = (HERE / fn).read_text(encoding='utf-8')
+        assert 'LLGUARD.note_eval()' in src and 'LLGUARD.fail(vpar' in src, fn
+        assert 'Numerical error: @' not in src, fn + " 旧的无计数 print 还在"
+    print("V34 PASS  guard 计数/isfinite 同源/CC_LLFAIL_MAX/熔断 exit(2) 可注入; 两入口已接线")
+
+
+def v35_sampler_kwargs_from_config():
+    """A2 钉: 采样设置单一来源 sampler_kwargs; 缺段落默认, 旧硬编码不得复活。"""
+    from frb_util import SAMPLER_DEFAULTS, sampler_kwargs
+    assert SAMPLER_DEFAULTS == {'n_live_points': 1500, 'evidence_tolerance': 0.1,
+                                'max_iter': 0, 'resume': True}
+    assert sampler_kwargs({}) == {'n_live_points': 1500, 'evidence_tolerance': 0.1,
+                                  'resume': True}
+    kw = sampler_kwargs({'sampler': {'n_live_points': 500, 'max_iter': 123,
+                                     'resume': False, 'evidence_tolerance': 0.5}})
+    assert kw == {'n_live_points': 500, 'evidence_tolerance': 0.5,
+                  'max_iter': 123, 'resume': False}, kw
+    cfg = load_config(str(HERE / "config_mini.json"))
+    kw = sampler_kwargs(cfg)
+    assert kw['n_live_points'] == 1500 and kw['resume'] is True and 'max_iter' not in kw
+    for fn in ("nest_samp_mini.py", "nest_simu_mini.py"):
+        src = (HERE / fn).read_text(encoding='utf-8')
+        assert 'sampler_kwargs(config)' in src, fn
+        assert 'resume=False' not in src and 'n_live_points=1000' not in src, fn
+    print("V35 PASS  sampler 设置进 config(sampler_kwargs 单一来源), 1000/0.5/False 硬编码已除")
+
+
+def v36_manifest_roundtrip_and_resume_gate():
+    """A3 钉: manifest 原子写/读回; resume.dat 存在时 config/数据不一致必须 SystemExit。"""
+    import json
+    import os
+    import tempfile
+    from frb_util import (check_resume, config_md5, count_lines, file_md5,
+                          manifest_path, read_manifest, write_manifest)
+    cfg = load_config(str(HERE / "config_mini.json"))
+    with tempfile.TemporaryDirectory() as td:
+        base = os.path.join(td, "LINE1")
+        p = os.path.join(td, "data.txt")
+        with open(p, 'w', encoding='utf-8') as f:
+            f.write("x\n")
+        doc = {'line': 'LINE1', 'config_md5': config_md5(cfg),
+               'input_md5': {'data.txt': file_md5(p)},
+               'sampler': {'n_live_points': 2000, 'evidence_tolerance': 0.1,
+                           'resume': True}}
+        write_manifest(manifest_path(base), doc)
+        assert not os.path.exists(manifest_path(base) + '.tmp'), "tmp 未 rename 干净"
+        assert read_manifest(manifest_path(base)) == doc
+        assert check_resume(os.path.join(td, "FRESH"), doc) is None   # 无 resume.dat ⇒ 不拦
+        open(base + 'resume.dat', 'w').close()
+        assert check_resume(base, doc) == doc          # 一致 ⇒ 放行
+        cfg2 = json.loads(json.dumps(cfg))
+        cfg2['prior']['gamma'] = [-3.0, 0.0]
+        try:
+            check_resume(base, dict(doc, config_md5=config_md5(cfg2)))
+            raise AssertionError("改 config 续跑没被拦(混血链)")
+        except SystemExit as e:
+            assert '拒绝续跑' in str(e)
+        with open(p, 'a', encoding='utf-8') as f:
+            f.write("y\n")
+        try:
+            check_resume(base, dict(doc, input_md5={'data.txt': file_md5(p)}))
+            raise AssertionError("换数据续跑没被拦")
+        except SystemExit:
+            pass
+        assert count_lines(p) == 2 and count_lines(os.path.join(td, 'nope')) == 0
+        # resume.dat 在而 manifest 缺 = 无凭据续跑, 必须拒（P3）
+        old_era = os.path.join(td, "OLDERA")
+        open(old_era + 'resume.dat', 'w').close()
+        try:
+            check_resume(old_era, doc)
+            raise AssertionError("缺 manifest 的 resume 没被拦")
+        except SystemExit as e:
+            assert 'manifest 缺失' in str(e)
+    print("V36 PASS  manifest 原子写/读回; resume 一致性闸拦 config 与数据两种改动")
+
+
+def _qa_run(td, base, cfgpath, truth=None, strict='1'):
+    import os
+    import subprocess
+    env = dict(os.environ)
+    env['CC_QA_STRICT'] = strict
+    cmd = [sys.executable, str(HERE / "qa_chains.py"), "--nest", base, "--config", cfgpath]
+    if truth:
+        cmd += ["--truth", truth]
+    return subprocess.run(cmd, cwd=str(HERE), capture_output=True,
+                          encoding='utf-8', errors='replace', timeout=300, env=env)
+
+
+def v37_qa_chains_gate():
+    """B4 钉: qa_chains 的贴边 FAIL / truth 越界 FAIL / CC_QA_STRICT 降级 / qa.json。"""
+    import json
+    import os
+    import tempfile
+    cfg = load_config(str(HERE / "config_mini.json"))
+    rng = np.random.default_rng(7)
+    n = 400
+    with tempfile.TemporaryDirectory() as td:
+        base = os.path.join(td, "QA1")
+        chain = np.column_stack([
+            10 ** rng.uniform(2.0, 4.0, n),                       # 线性 phis
+            rng.normal(-1.5, 0.05, n), rng.normal(43.4, 0.2, n),
+            rng.normal(38.5, 0.05, n), rng.normal(0.4, 0.02, n),
+            rng.normal(0.3, 0.01, n),
+            np.where(rng.random(n) < 0.3, 2.5 + 1e-3, rng.normal(3.8, 0.3, n)),
+            rng.normal(1.0, 0.2, n), rng.normal(0.0, 1.0, n)])    # 末列 = lik
+        np.savetxt(base + "post_equal_weights.dat", chain)
+        oldcfg = json.loads(json.dumps(cfg))
+        oldcfg['prior']['ln_mu_host'] = [2.5, 6.5]      # 旧下界 ⇒ 30% 贴边
+        cfgp = os.path.join(td, "old.json")
+        with open(cfgp, 'w', encoding='utf-8') as f:
+            json.dump(oldcfg, f)
+        r = _qa_run(td, base, cfgp)
+        assert r.returncode == 1, r.stdout
+        assert 'edge:ln_mu_host' in r.stdout
+        q = json.load(open(base + "qa.json", encoding='utf-8'))
+        assert q['verdict'] == 'FAIL' and abs(q['edge_frac']['ln_mu_host'] - 0.3) < 0.06, q
+        assert abs(q['rho_gamma_logEchar']) < 0.5       # 独立抽样, 不应有强简并
+        assert q['manifest'] is False and 'manifest' in r.stdout   # 无 manifest 要明说
+        # run.log 的 ln(Z) 行才是真 lnZ 轨迹（ev.dat 第 9 列不是, P2）
+        with open(base + '.run.log', 'w', encoding='utf-8') as f:
+            f.write("Nested Sampling ln(Z):             -100.500000\n"
+                    "Nested Sampling ln(Z):             -100.250000\n"
+                    "Acceptance Rate:                        0.170000\n")
+        _qa_run(td, base, cfgp)
+        q1b = json.load(open(base + "qa.json", encoding='utf-8'))
+        assert abs(q1b['tail_dlnZ'] - 0.25) < 1e-9, q1b
+        assert abs(q1b['acceptance'] - 0.17) < 1e-9, q1b
+        assert q1b['tail_dlogL'] is None                # 没给 ev.dat ⇒ 该项跳过
+        r2 = _qa_run(td, base, cfgp, strict='0')
+        # 子进程 stdout 在 Windows 控制台是 GBK 字节, 断言只认 ASCII 标记
+        # (降级与否以 qa.json 的 verdict + 退出码为准, 不看中文措辞)
+        assert r2.returncode == 0 and 'CC_QA_STRICT=0' in r2.stdout, r2.stdout
+        q2 = json.load(open(base + "qa.json", encoding='utf-8'))
+        assert q2['verdict'] == 'WARN' and not q2['fails'], q2
+        # 新先验下贴边不 FAIL; 真值两个参数出 99% 区间 ⇒ truth FAIL
+        cfgp2 = os.path.join(td, "new.json")
+        with open(cfgp2, 'w', encoding='utf-8') as f:
+            json.dump(cfg, f)
+        tr_bad = os.path.join(td, "bad.json")
+        with open(tr_bad, 'w', encoding='utf-8') as f:
+            json.dump({"phis": 1e3, "gamma": -1.5, "logEs": 43.4, "logE0": 38.5,
+                       "mu_w": 0.9, "sigma_w": 0.9, "ln_mu_host": 3.8,
+                       "ln_sigma_host": 1.0}, f)
+        r3 = _qa_run(td, base, cfgp2, truth=tr_bad)
+        assert r3.returncode == 1 and 'truth' in r3.stdout, r3.stdout
+        tr_ok = os.path.join(td, "ok.json")
+        with open(tr_ok, 'w', encoding='utf-8') as f:
+            json.dump({"phis": 1e3, "gamma": -1.5, "logEs": 43.4, "logE0": 38.5,
+                       "mu_w": 0.4, "sigma_w": 0.3, "ln_mu_host": 3.8,
+                       "ln_sigma_host": 1.0}, f)
+        r4 = _qa_run(td, base, cfgp2, truth=tr_ok)
+        assert r4.returncode == 0, r4.stdout
+    print("V37 PASS  qa 贴边 FAIL(30%>20%)/truth 越界 FAIL/STRICT=0 降级/qa.json 字段齐")
+
+
+def v38_shell_run_dir_and_gate_wiring():
+    """B1-B5 钉: 运行目录制/追加日志/无缓冲/qa 闸门/轮询/备份 的静态接线。"""
+    rs = (HERE / "run_samp_mini.sh").read_text(encoding='utf-8')
+    ru = (HERE / "run_simu_mini.sh").read_text(encoding='utf-8')
+    ra = (HERE / "run_all_mini.sh").read_text(encoding='utf-8')
+    ds = (HERE / "draw_samp_mini.sh").read_text(encoding='utf-8')
+    du = (HERE / "draw_sim_mini.sh").read_text(encoding='utf-8')
+    for tag, s in (("run_samp", rs), ("run_simu", ru)):
+        assert 'export PYTHONUNBUFFERED=1' in s, tag + " 缺无缓冲(B2)"
+        assert 'CC_RUN_TAG:-$(date' in s and 'ln -sfn' in s, tag + " 缺 run 目录制(B1/B3)"
+    assert '>> "$log" 2>&1' in rs and ': > "$log"' not in rs, "samp 日志必须追加不截断"
+    assert '续跑: CC_RUN_TAG=' in rs, "trap 里要给续跑命令"
+    assert '>> "$log" 2>&1' in ru and 'tail -20 "$log"' in ru, "simu 日志重定向+失败尾部"
+    assert 'sleep 60' not in ra and 'while [ $_i -lt 12 ]' in ra, "开局体检改轮询(B5)"
+    assert 'Step 3b' in ra and 'qa_chains.py' in ra and 'CC_RUN_TAG/$out' in ra, "qa 闸门(B4)"
+    assert 'cp -p "$f" "${f}.bak_$CC_RUN_TAG"' in ra, "filtered 备份(B5)"
+    assert 'CC_SAMP_DIR' in ds and 'nest_out_mini/samp/latest' in ds
+    assert 'CC_SIMU_DIR' in du and 'nest_out_mini/simu/latest' in du
+    assert './nest_out_mini/simu/simdat_${phis}.truth.json' in du, "truth 留平铺路径"
+    for tag, s in (("draw_samp", ds), ("draw_sim", du)):
+        assert '链目录 $' in s and 'exit 1' in s, tag + " 缺链目录显式报错"
+    sd = (HERE / "simudat_mini.sh").read_text(encoding='utf-8')
+    assert 'cksum' in sd and '-seed $SEED' in sd, "simudat 必须按 tag 派生 seed(P1)"
+    assert 'CC_RUN_TAG=$CC_RUN_TAG sh run_all_mini.sh' in ra, "qa 放行提示要含同 tag 续跑说明"
+    print("V38 PASS  五个 shell 的运行目录制/追加日志/无缓冲/qa 闸门/轮询/备份接线齐")
+
+
 def main():
     v1_mean_anchor()
 
@@ -1548,6 +1771,11 @@ def main():
     v31_time_dilation_outside_power()
     v32_logdistr_1dz_contract()
     v33_mock_and_pz_determinism()
+    v34_llfail_guard_counts_and_breaks()
+    v35_sampler_kwargs_from_config()
+    v36_manifest_roundtrip_and_resume_gate()
+    v37_qa_chains_gate()
+    v38_shell_run_dir_and_gate_wiring()
     print("\nALL LOCAL TESTS PASS")
     return 0
 

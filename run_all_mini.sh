@@ -9,6 +9,10 @@
 
 set -e
 export OMP_NUM_THREADS=1
+# 一次 campaign 一个 tag：samp/simu 两个 run 目录共用，manifest 原样记录（B1-B3）
+export CC_RUN_TAG=${CC_RUN_TAG:-$(date +%Y%m%d_%H%M%S)}
+# 子脚本的 python stdout 进文件；不加则块缓冲，被墙钟杀掉时日志全丢（B2）
+export PYTHONUNBUFFERED=1
 
 # PPC 抽样组数与并行度（可用环境变量覆盖: PPC_DRAWS=300 PPC_J=8 sh run_all_mini.sh）
 # 成本实测: 单个 3373 事件 mock ≈ 5.9 s(单核) → draws/×5.9/j 秒每线
@@ -31,6 +35,10 @@ T_TOTAL_START=$(date +%s)
 # ====== 阶段 1：数据准备（串行，都很快） ======
 echo "===== Step 1/5: 预处理 CHIME catalog ====="
 T0_START=$(date +%s)
+# preprocess 直接覆盖 data/filtered.*；先按 tag 备份，误跑可回滚（B5）
+for f in data/filtered.fits data/filtered.txt; do
+    if [ -f "$f" ]; then cp -p "$f" "${f}.bak_$CC_RUN_TAG"; fi
+done
 python3 preprocess_catalog.py
 T0=$(( $(date +%s) - T0_START ))
 echo ""
@@ -72,7 +80,12 @@ kill_branch() {
 # 开局体检：B（真实样本三线）若在头 60 s 内就崩（缺 dm_exc_ne2025 列、filtered.fits
 # 缺 NSAMPLE/NREF10 header 键之类的接线错误），不要傻等 A 跑完几小时才发现。
 B_DONE=0
-sleep 60
+# 轮询代替开局固定等 60 s：每 5 s 探一次 PID_B，上限仍 60 s；开局正常时省 ~55 s（B5）
+_i=0
+while [ $_i -lt 12 ] && kill -0 $PID_B 2>/dev/null; do
+    sleep 5
+    _i=$((_i + 1))
+done
 if ! kill -0 $PID_B 2>/dev/null; then
     if wait $PID_B; then
         B_DONE=1        # 极少见：已经成功退出，记下免得下面重复 wait 拿到 127
@@ -103,6 +116,23 @@ fi
 T23=$(( $(date +%s) - T23_START ))
 echo ""
 
+# ====== 阶段 2b：链自动验收（碎后验/贴边链不许流进出图和 PPC, B4） ======
+echo "===== Step 3b/5: 链自动验收 qa_chains (4 条链) ====="
+qa_gate() {
+    if ! python3 qa_chains.py --config config_mini.json "$@"; then
+        echo "ERROR: qa FAIL ($*)。链位置见上；放行: CC_QA_STRICT=0 CC_RUN_TAG=$CC_RUN_TAG sh run_all_mini.sh（mock 按 tag 种子逐位复现、链走 resume，同 tag 重跑安全）" >&2
+        exit 1
+    fi
+}
+for mw in ne2001 ymw16 ne2025
+do
+    out=$(echo "$mw" | tr 'a-z' 'A-Z')
+    qa_gate --nest "./nest_out_mini/samp/$CC_RUN_TAG/$out"
+done
+qa_gate --nest "./nest_out_mini/simu/$CC_RUN_TAG/simdat_1e3" \
+        --truth ./nest_out_mini/simu/simdat_1e3.truth.json
+echo ""
+
 # ====== 阶段 3：绘图（串行，都很快） ======
 echo "===== Step 4/5: 绘制后验分布图 + 逐事件 P(z) ====="
 T4A_START=$(date +%s)
@@ -124,7 +154,7 @@ do
     out=$(echo "$mw" | tr 'a-z' 'A-Z')
     _t0=$(date +%s)
     if python3 ppcheck.py --config config_mini.json \
-            --nest ./nest_out_mini/samp/${out} -mw ${mw} \
+            --nest ./nest_out_mini/samp/$CC_RUN_TAG/${out} -mw ${mw} \
             --draws ${PPC_DRAWS} -j ${PPC_J} \
             -o ./plots_mini/samp/${out}_ppc.pdf
     then tag=ok; else tag=FAIL; fi
@@ -162,6 +192,7 @@ echo "  系统误差线: 同一条真实数据线加环境变量/改 config 重�
 echo "    CC_SURVIVAL=0.4639 sh run_samp_mini.sh   # one-off 口径存活率线 (1563/3369, 缺省全部 burst 口径 1563/4334)"
 echo "    config: analysis.sfr_curve=Yuksel2008    # SFR 曲线"
 echo "    config: dm_model.igm.F=0.09 / 0.5        # IGM 涨落宽度括号线(Macquart 边际化区间)"
+echo "    config: dm_model.halo.DMsmin/DMsmax=20/80 # 晕窗括号线(均值 50, 与主线 U[0,60] 对照)"
 echo "    config: 删掉 prior_shape 段              # 平坦先验敏感度(ln Z 不可跨先验比)"
 echo "  模型比较: 读 nest_out_mini/samp/*.log 的 ln Z ± err(仅同一先验内可比)"
 exit

@@ -52,6 +52,13 @@ fov=200
 mkdir -p simu_mini nest_out_mini/simu
 
 # 缩减: 只跑 phis=1e3 一组
+# mock 由 campaign tag 派生种子逐位复现（P1, 2026-10-31）：同 CC_RUN_TAG 重跑时
+# simufrb 拿同一个 seed ⇒ mock 字节不变 ⇒ nest_simu 的 check_resume input_md5 闸
+# 不会误拦"QA 放行重跑/被杀后续跑"；不同 tag 仍是不同随机实现（跨 campaign 多样性保留）。
+RUN_TAG=${CC_RUN_TAG:-$(date +%Y%m%d_%H%M%S)}
+SEED=$(printf '%s' "$RUN_TAG" | cksum | cut -d' ' -f1)
+echo "[simudat] tag=${RUN_TAG} seed=${SEED}"
+
 for phis in 1e3
 do
     outputfile=./simu_mini/simdat_${phis}_${fov}.txt
@@ -61,7 +68,7 @@ do
     timed "simufrb phis=${phis} N=$Nfrb" python3 simufrb.py \
         -ns $Nfrb -phis $phis -gamma $gamma -logEs $logEs -logE0 $logE0 -dnu $dnu \
         -mu ${mu} -sig ${sigma} -ln_mu_host ${ln_mu_host} -ln_sigma_host ${ln_sigma_host} \
-        -ga $g -npol $np -bw $bw -ts $Ts -sn0 $sn0 -fov $fov \
+        -ga $g -npol $np -bw $bw -ts $Ts -sn0 $sn0 -fov $fov -seed $SEED \
         -out $outputfile --config config_mini.json
 
     # 写入注入真值(原始物理单位)。绘图端(pltpost -truth / pltpz -truth)统一用

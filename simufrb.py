@@ -94,8 +94,9 @@ def Simu_FRBs_Eiso(phis, gamma, logEs, logE0, mu, sigma, dnu, ns, fov, npol, g, 
         vlnEps = np.random.uniform(-np.log(2), 0, ns0)
         vEps = np.exp(vlnEps)
 
-        # 采样星系红移（加入 SFR 宇宙学演化权重 + 1/(1+z) 时间膨胀因子）
-        # p(z) ∝ dV/dz · R(z) / (1+z)，与推断端 rate_2d_E 的 (dV/dz)/(1+z)·evolution 一致
+        # 采样星系红移（SFR 宇宙学演化权重）: p(z) ∝ dV/dz · R(z)·evolution(z)。
+        # (1+z) 时间膨胀已含在 evolution_factor 内，【不要】再单独除 (1+z)——
+        # 与推断端 rate_2d_E / Norm1D_E 同一口径
         vZg = np.arange(0, 5.1, 5.1 / 10000)
         vlik = dis.Distribution_volume(vZg) * dis.evolution_factor(vZg)
         vZ = Sampling1D(vZg, vlik, 0, 5.0, ns0)

@@ -2,6 +2,7 @@
 
 import numpy as np
 import time
+import sys
 import pymultinest
 import argparse
 
@@ -14,6 +15,7 @@ lf = Loadfiles()
 
 dnu = 1000.0  # 能量定义参考带宽，__main__ 中从 config 更新
 SURVIVAL = 1.0  # Poisson 项样本存活率，__main__ 中从 filtered.fits header 读
+LLGUARD = LlfailGuard()  # -1e30 失败计数 + 熔断（frb_util 单一实现, A1）
 
 def lnlik(vpar):
     """能量版似然函数（CHIME 单巡天）。
@@ -27,6 +29,7 @@ def lnlik(vpar):
     先验空间恒为常数平台，MultiNest 照常"收敛"并输出一个看上去正常的平坦后验。
     TypeError/AttributeError/KeyError 是接线错误，必须当场炸掉。
     """
+    LLGUARD.note_eval()
     try:
         # 归一化因子（能量版）
         norm = dis.Norm1D_E(vSN0, vBW, vNpol, vG, vTs,
@@ -45,17 +48,14 @@ def lnlik(vpar):
         loglik_poi = np.sum(er.log_dis_poi(np.array([rho * SURVIVAL]),
                                            vN, vFOV, vTime))
         res = loglik_norm + loglik_poi
-    except (ArithmeticError, ValueError):
+    except (ArithmeticError, ValueError) as exc:
         # 数值域失败（OverflowError、brentq 括号失配等）：给一个有限的极低似然，
-        # 别让一次求值废掉整轮 10 小时的采样。
-        import traceback
-        print('Numerical error: @', vpar)
-        traceback.print_exc()
-        return -1e30
+        # 别让一次求值废掉整轮 10 小时的采样；但计入熔断计数（A1）。
+        return LLGUARD.fail(vpar, exc)
     # numpy 默认只 warn 不抛，nan/inf 会一路穿到这里；MultiNest 的 C 层拿 nan
-    # 做比较是未定义行为，故显式兜底。
+    # 做比较是未定义行为，故显式兜底（同样计入熔断计数）。
     if not np.isfinite(res):
-        return -1e30
+        return LLGUARD.fail(vpar)
     return res
 
 def myprior(cube, ndim, nparams):
@@ -190,14 +190,46 @@ if __name__ == '__main__':
     print("Running Nest Sampling ...")
     # run MultiNest
     import os
-    output_dir = config['output']['nest_out_dir'] + 'samp/'
-    os.makedirs(output_dir, exist_ok=True)
+    import scipy
+    # -o 含 / 就是全路径（run 脚本传 $RUN_DIR/<名>），直接用；裸名才拼传统平铺
+    # 前缀——手工单跑行为不变（A3 配套）。
+    if '/' in fout or os.sep in fout:
+        basename = fout
+    else:
+        basename = config['output']['nest_out_dir'] + 'samp/' + fout
+    os.makedirs(os.path.dirname(os.path.abspath(basename)), exist_ok=True)
+    skw = sampler_kwargs(config)
+    doc = {
+        'line': os.path.basename(fout),
+        'mw': args.mwmodel,
+        'run_tag': os.environ.get('CC_RUN_TAG', ''),
+        'argv': sys.argv,
+        'config': config,
+        'config_md5': config_md5(config),
+        'input_md5': {os.path.basename(fcat): file_md5(fcat),
+                      os.path.basename(fsvy): file_md5(fsvy)},
+        'SURVIVAL': float(SURVIVAL),
+        'sel_mode': dis.sel_mode,
+        'sampler': skw,
+        'versions': {'python': sys.version.split()[0], 'numpy': np.__version__,
+                     'scipy': scipy.__version__},
+        'start_utc': utc_now(),
+        'pid': os.getpid(),
+    }
+    # resume 一致性闸：resume.dat 已存在而 config/数据/采样设置变了就拒绝续跑，
+    # 否则 MultiNest 只认 ndim，会无声产出两轮混血链（A3）。
+    if skw['resume']:
+        check_resume(basename, doc)
+    write_manifest(manifest_path(basename), doc)
     pymultinest.run(myloglike, myprior, len(par_lo),
                     importance_nested_sampling=False,
-                    resume=False,
                     verbose=True,
                     sampling_efficiency='model',
-                    n_live_points=1000,
-                    outputfiles_basename=config['output']['nest_out_dir'] + 'samp/' + fout)
-    print(f"[samp] MultiNest 总耗时 {time.perf_counter()-t_total0:.1f}s "
-          f"({(time.perf_counter()-t_total0)/60:.1f} min)")
+                    outputfiles_basename=basename, **skw)
+    wall = time.perf_counter() - t_total0
+    print(f"[samp] MultiNest 总耗时 {wall:.1f}s ({wall/60:.1f} min)")
+    doc.update(end_utc=utc_now(), wall_seconds=round(wall, 1),
+               n_iter=count_lines(str(basename) + 'ev.dat'),
+               n_post=count_lines(str(basename) + 'post_equal_weights.dat'),
+               n_eval=LLGUARD.n_eval, n_llfail=LLGUARD.n_fail)
+    write_manifest(manifest_path(basename), doc)

@@ -5,6 +5,10 @@ from scipy.interpolate import interp1d
 import scipy.special as spf
 import json
 import os
+import sys
+import time
+import hashlib
+import traceback
 from pathlib import Path
 
 def load_config(config_path='config_mini.json'):
@@ -33,6 +37,22 @@ PARAM_ORDER = ['log_phi0', 'gamma', 'log_Echar', 'log_E0',
 # 只报 95% 上限的参数（替代 pltpost.py 里裸索引的 `vari != 3` 特判）
 PARAM_UPPER_ONLY = {'log_E0'}
 N_PARAMS = len(PARAM_ORDER)
+
+# 参数 → LaTeX 标签的单一来源（2026-10-31 工程3）：绘图端（pltpost 等）从这里取，
+# 禁止再硬编码——PARAM_ORDER 增删/换序时标签自动跟随，不会静默错位。
+# 字符串与 pltpost 原硬编码逐字节一致（改前渲染过 A/B 对比）。
+PARAM_LABELS = {
+    'log_phi0':      r'$\log\,\phi_0$',
+    'gamma':         r'$\gamma$',
+    'log_Echar':     r'$\log E_{\rm char}$',
+    'log_E0':        r'$\log E_0$',
+    'mu_w':          r'$\mu_w$',
+    'sigma_w':       r'$\sigma_w$',
+    'ln_mu_host':    r'$\ln\mu_{\rm host}$',
+    'ln_sigma_host': r'$\ln\sigma_{\rm host}$',
+}
+assert set(PARAM_LABELS) == set(PARAM_ORDER), \
+    "PARAM_LABELS 与 PARAM_ORDER 不同步: %s" % (set(PARAM_LABELS) ^ set(PARAM_ORDER))
 
 # 望远镜参数库（硬编码，方便后续扩展）
 # bw: 辐射计方程用的【实际观测】带宽 [MHz]（CHIME 400-800 MHz 带）
@@ -692,9 +712,9 @@ class AstroDistribution:
         else:
             logint1 = self.log_IntBeam_E(loge, gamma, logEs, logE0)
         logfw = self.log_dis_logw(logw0, mu, sigma)
-        # p(z) ∝ (dV/dz) · evolution(z) / (1+z)
-        # /(1+z) 为源帧→观测帧时间膨胀因子,与 Norm1D_E / rate_2d_E / simufrb.py 采样端一致。
-        # (1+z) 时间膨胀已在 evolution_factor（Shin Eq.3 幂内）中，此处不再重复除
+        # p(z) ∝ (dV/dz) · evolution(z)。【不要】在此再除 (1+z)：源帧→观测帧的
+        # 时间膨胀已含在 evolution_factor 中（其 docstring 明确"调用方不得再额外
+        # 乘/除 (1+z)"），与 Norm1D_E / rate_2d_E / simufrb.py 采样端同一口径。
         logfz = self.log_Distribution_volume(z)
         dmi_mean = self.cos.DispersionMeasure_IGM(z)
         ln_mu_z = ln_mu_host + self.host_dm_evol * np.log(1.0 + z)
@@ -808,12 +828,18 @@ class AstroDistribution:
         fw = ft * vw                                                              # (nz,nlogw,1)
         et = self.cos.Energy(z3d, flu=fw, dnu=dnu)                                # (nz,nlogw,1)
         loget = np.log10(et)
-        loget = np.where(np.isfinite(loget) & (loget >= logE0), loget, logE0)
+        # 非有限当场炸（2026-10-31 审查项，对齐全仓纪律）：旧写法把 NaN/Inf 静默替换
+        # 成 logE0（最宽松阈值）。et 由有限输入构造，先验盒内 V27/V29 实测恒有限；
+        # 若触发即接线/参数异常，raise 后由 lnlik 的窄 except 接住、计入 llfail。
+        if not np.all(np.isfinite(loget)):
+            raise ValueError("Energy() 给出非有限 loget（et 含 NaN/Inf）")
+        loget = np.where(loget >= logE0, loget, logE0)
         # IntE: veps(neps,) × loget(nz,nlogw,1) → (nz,nlogw,neps)
         int_eps_grid = self.IntE(veps, gamma, logEs, loget)                       # (nz,nlogw,neps)
         int_eps = np.sum(int_eps_grid / veps[np.newaxis, np.newaxis, :] / np.log(2) * stepeps, axis=2)  # (nz,nlogw)
         int_w = np.sum(int_eps * self.dis_logw(vlogw, mu, sigma)[np.newaxis, :] * steplogw, axis=1)     # (nz,)
-        # /(1+z) 为源帧→观测帧时间膨胀因子，与 rate_2d_E / simufrb.py 采样端一致
+        # (1+z) 时间膨胀已含在 evolution_factor 内，【不要】再单独除 (1+z)；
+        # 与 rate_2d_E / simufrb.py 采样端同一口径
         fz = self.Distribution_volume(vz) * self.evolution_factor(vz)  # (nz,)
         nf = np.sum(vz * stepz * fz * int_w)
         if nf <= 0:
@@ -866,7 +892,10 @@ class EventRate:
         fw = ft * vw                                                                # (nz,nlogw,1)
         et = self.cos.Energy(z3d, flu=fw, dnu=dnu)                                  # (nz,nlogw,1)
         loget = np.log10(et)
-        loget = np.where(np.isfinite(loget) & (loget >= logE0), loget, logE0)
+        # 同 Norm1D_E：非有限当场炸，不静默换成 logE0（见 814 行注）。
+        if not np.all(np.isfinite(loget)):
+            raise ValueError("Energy() 给出非有限 loget（et 含 NaN/Inf）")
+        loget = np.where(loget >= logE0, loget, logE0)
         # IntE: veps(neps,) × loget(nz,nlogw,1) → (nz,nlogw,neps)
         int_eps_grid = phis * self.ad.IntE(veps, gamma, logEs, loget)               # (nz,nlogw,neps)
         int_eps = np.sum(int_eps_grid / veps[np.newaxis, np.newaxis, :] / np.log(2) * stepeps, axis=2)  # (nz,nlogw)
@@ -1269,7 +1298,7 @@ def read_selection_survival(catalog_path, mode='step'):
         ref_key = 'NREF10' if mode == 'step' else 'NSNR12'
         n_ref = int(hdr[ref_key])
         s = n_sam / n_ref
-        if mode == 'step' and 'SURVIV' in hdr                 and abs(float(hdr['SURVIV']) * n_ref - n_sam) > 0.5:
+        if mode == 'step' and 'SURVIV' in hdr and abs(float(hdr['SURVIV']) * n_ref - n_sam) > 0.5:
             raise ValueError("header 不自洽：SURVIV=%r 与 NSAMPLE/NREF10=%.6f 不符"
                              % (hdr['SURVIV'], s))
     except FileNotFoundError:
@@ -1362,3 +1391,183 @@ def Sampling1D(x, y, x1, x2, n):
         res = np.append(res, vx[vy <= fuc(vx)])
         nt = len(res)
     return res
+
+
+# ================= 采样护栏 / 采样设置 / 产物溯源（2026-10-30, A1-A3） =================
+# 三个小节都是 nest_samp_mini / nest_simu_mini / qa_chains / pltpost 共用的单一实现，
+# 禁止在入口脚本里各自内联一份（本仓库惯例：共用逻辑进 frb_util）。
+
+class LlfailGuard:
+    """-1e30 似然哨兵的计数 + 熔断器。
+
+    背景（V27 事故）：似然变常数平台时 MultiNest 照常"收敛"，输出一个看上去完整
+    的平坦后验，10 小时墙钟白费。孤立角落溢出是先验盒的正常代价（默认阈值 200 次
+    余量很宽）；连续大量失败只可能是接线/形状/数据错误，此时当场死比跑完便宜。
+
+    用法：lnlik 入口 `guard.note_eval()`；except 分支与 isfinite 兜底都
+    `return guard.fail(vpar, exc)`。每次失败打一行 flush 过的 `[llfail]`（被墙钟
+    SIGKILL 时不丢），完整 traceback 只打前 trace_cap 次（防热循环刷出几百 MB 日志）。
+    threshold <= 0（如 CC_LLFAIL_MAX=0）= 【禁用熔断】只计数不断路；正整数才断路。
+    exit_func 可注入（测试用），默认 os._exit(2)；配合 resume=True 续跑是安全的。
+    """
+
+    def __init__(self, threshold=None, exit_func=None, trace_cap=10,
+                 summarize_every=100):
+        self.n_eval = 0
+        self.n_fail = 0
+        if threshold is None:
+            threshold = int(os.environ.get('CC_LLFAIL_MAX', '200'))
+        self.threshold = int(threshold)
+        self.exit_func = os._exit if exit_func is None else exit_func
+        self.trace_cap = int(trace_cap)
+        # ≤0 钳到 1（=退回逐次打印的旧行为）：0 会令 fail() 的取模在越过 trace_cap
+        # 后除零——guard 不允许自己成为新的不明死法（2026-10-31 外审）。
+        self.summarize_every = max(1, int(summarize_every))
+
+    def note_eval(self):
+        self.n_eval += 1
+
+    def fail(self, vpar, exc=None):
+        self.n_fail += 1
+        vals = np.ravel(np.asarray(vpar, dtype=float))[:len(PARAM_ORDER)]
+        msg = '[llfail] #%d/%d @ [%s]' % (
+            self.n_fail, self.n_eval, ' '.join('%.4g' % v for v in vals))
+        if exc is not None:
+            msg += '  (%s: %s)' % (type(exc).__name__, exc)
+        if self.n_fail <= self.trace_cap:
+            print(msg, flush=True)
+        elif self.n_fail % self.summarize_every == 0:
+            # 降频汇总（2026-10-31 工程6）：CC_LLFAIL_MAX=0 + 系统性平台时旧写法
+            # 每个 eval 刷一行（几十万行）；每 summarize_every 次打一行带累计数。
+            # 总计数以 manifest 的 n_llfail 为准，不因降频丢失。
+            print('[llfail] 降频汇总: 已 %d/%d 次失败' % (self.n_fail, self.n_eval),
+                  flush=True)
+        if exc is not None and self.n_fail <= self.trace_cap:
+            traceback.print_exc()
+        if self.threshold > 0 and self.n_fail >= self.threshold:
+            print('[llfail] 熔断: 失败 %d 次 >= CC_LLFAIL_MAX=%d，进程当场退出(2)。'
+                  '修复原因后用同一 CC_RUN_TAG 续跑(resume)。'
+                  % (self.n_fail, self.threshold), flush=True)
+            self.exit_func(2)
+        return -1e30
+
+
+# 采样设置的代码内默认值；config 的 sampler 段缺任何键都落回这里。
+# nlive=1500 是 2026-10-31 拍的中间档：2000 把 campaign 拉到 ~8.6 天/线（n_dead ∝
+# nlive，12.25 s/eval），1000 出图碎裂风险高，1500 ≈ 6.5 天/线换 ~1.5× 等权样本。
+# tol 由旧 0.5 收紧到 0.1：只把停止点推到 X_end ∝ tol ⇒ +nlive·ln(0.5/0.1) ≈
+# +1.6×nlive evals（~+5%），lnZ 误差与尾部样本同时改善；被墙钟杀掉的损失由
+# resume=True 兜住。四条线必须同设置（ΔlnZ 只在同 nlive/tol 内横比）。
+SAMPLER_DEFAULTS = {'n_live_points': 1500, 'evidence_tolerance': 0.1,
+                    'max_iter': 0, 'resume': True}
+
+
+def sampler_kwargs(cfg):
+    """把 config['sampler'] 翻译成 pymultinest.run 的关键字参数。
+
+    max_iter=0 表示不限（不传该参数）：按单次似然耗时估 max_iter 估错了会把本可
+    收敛的轮次截断，真正的续跑机制是 resume。
+    """
+    s = dict(SAMPLER_DEFAULTS)
+    s.update(cfg.get('sampler', {}) or {})
+    kw = {'n_live_points': int(s['n_live_points']),
+          'evidence_tolerance': float(s['evidence_tolerance']),
+          'resume': bool(s['resume'])}
+    mi = int(s['max_iter'])
+    if mi > 0:
+        kw['max_iter'] = mi
+    return kw
+
+
+def file_md5(path, chunk=1 << 20):
+    h = hashlib.md5()
+    with open(path, 'rb') as f:
+        for blk in iter(lambda: f.read(chunk), b''):
+            h.update(blk)
+    return h.hexdigest()
+
+
+def config_md5(cfg):
+    """config 的规范化指纹：sort_keys 后与键序/空白无关。"""
+    blob = json.dumps(cfg, sort_keys=True, ensure_ascii=False).encode('utf-8')
+    return hashlib.md5(blob).hexdigest()
+
+
+def manifest_path(basename):
+    """MultiNest 惯例的无点拼接：root+'phys_live.points' 式，故为 <basename>manifest.json。"""
+    return str(basename) + 'manifest.json'
+
+
+def utc_now():
+    return time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+
+
+def write_manifest(path, doc):
+    """tmp+rename 原子写：被墙钟杀掉时不会留下半截 manifest。"""
+    tmp = str(path) + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(doc, f, ensure_ascii=False, indent=1, sort_keys=True)
+        f.write('\n')
+    os.replace(tmp, path)
+
+
+def read_manifest(path):
+    with open(path, encoding='utf-8') as f:
+        return json.load(f)
+
+
+def count_lines(path):
+    """产物行数（ev.dat 的 n_iter / post_equal_weights 的 n_post）；缺文件返回 0。"""
+    if not os.path.exists(path):
+        return 0
+    with open(path, 'rb') as f:
+        return sum(1 for _ in f)
+
+
+# resume 一致性闸要比对的字段：任一不一致就拒绝续跑（否则产出两轮混血链）。
+_MANIFEST_RESUME_KEYS = ('line', 'config_md5', 'input_md5', 'sampler')
+
+
+def check_resume(basename, doc):
+    """resume 一致性闸：basename 无 resume.dat 则不拦（返回 None）。
+
+    有 resume.dat 但【缺 manifest】也拒绝：新工作流里 manifest 先于采样写入，
+    缺 manifest 的 resume.dat 只可能来自旧代码时代或人手删改，续跑等于无凭据
+    混血（P3, 2026-10-31）。manifest 在而字段不一致同样拒绝：MultiNest 的
+    resume 只认 ndim，改了 config/数据/采样设置续跑会无声产出混血链。
+    """
+    if not os.path.exists(str(basename) + 'resume.dat'):
+        return None
+    mp = manifest_path(basename)
+    if not os.path.exists(mp):
+        raise SystemExit(
+            '[manifest] 拒绝续跑 %s：resume.dat 存在但 manifest 缺失（无溯源凭据）。'
+            '请归档旧目录或换 CC_RUN_TAG 重跑。' % basename)
+    old = read_manifest(mp)
+    bad = []
+    for k in _MANIFEST_RESUME_KEYS:
+        if old.get(k) != doc.get(k):
+            bad.append('%s: 旧=%r 新=%r' % (k, old.get(k), doc.get(k)))
+    if bad:
+        raise SystemExit(
+            '[manifest] 拒绝续跑 %s：resume.dat 已存在但 manifest 不一致\n  %s\n'
+            '请归档旧目录或换 CC_RUN_TAG 重跑。' % (basename, '\n  '.join(bad)))
+    return old
+
+
+def manifest_plot_note(basename, cfg):
+    """pltpost 出图前的溯源校验（C1）：返回 (标题后缀, 警告文本或 None)。
+
+    有 manifest → 标题追加 run=<tag> cfg:<md5 前 8 位>；manifest 的 config_md5 与
+    当前 config 不同源时给大字警告。无 manifest → 明说未校验（旧链不冒充校验过）。
+    """
+    mp = manifest_path(basename)
+    if not os.path.exists(mp):
+        return '', '[pltpost] 无 manifest，本图未做 config/数据同源校验'
+    doc = read_manifest(mp)
+    note = '  run=%s cfg:%s' % (doc.get('run_tag', '?'), str(doc.get('config_md5', '?'))[:8])
+    warn = None
+    if doc.get('config_md5') != config_md5(cfg):
+        warn = ('[pltpost] !! config 与链不同源！链的 config_md5=%s，当前=%s'
+                % (doc.get('config_md5'), config_md5(cfg)))
+    return note, warn

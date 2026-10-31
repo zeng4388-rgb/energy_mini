@@ -4,9 +4,9 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib as mpl
 import argparse
-import pymultinest
 from scipy.ndimage import gaussian_filter
-from frb_util import (load_config, truth_vector, PARAM_ORDER, PARAM_UPPER_ONLY)
+from frb_util import (load_config, truth_vector, PARAM_ORDER, PARAM_UPPER_ONLY,
+                      manifest_plot_note, PARAM_LABELS)
 
 plt.style.use("classic")
 #mpl.rcParams['font.family'] ='Times New Roman'
@@ -14,6 +14,10 @@ mpl.rcParams['font.size']=24
 mpl.rcParams['xtick.labelsize']=16
 mpl.rcParams['ytick.labelsize']=16
 mpl.rcParams['axes.labelsize']=22
+# 关掉 ScalarFormatter 的 offset 记数法: 窄后验窗口下(γ≈-1.8, log E_char≈41.6)
+# 它会把刻度写成相对值 0.10/0.05/0.00 并把 "-1.7"、"+4.1e1" 作为 offset 小字
+# 画在轴尾, 与隐藏了刻度数字的 2D 面板混在一起, 看起来像乱码。
+mpl.rcParams['axes.formatter.useoffset'] = False
 
 def plot2dposterior_withconf(dat, likli, indx=[], labels=[], rate=0.5,
         par=np.array([]), truth_par=None,
@@ -25,7 +29,7 @@ def plot2dposterior_withconf(dat, likli, indx=[], labels=[], rate=0.5,
     labels: the LaTex label of the given parameter
     rate: the percentage of data to plot, e.g. 0.3 means plot data from 70% to
     the end.
-    par: 后验 MAP(黑色实线)
+    par: 后验里的最大似然样本 max-L(黑色实线); 不是连续后验的众数/MAP
     truth_par: 注入真值数组(红色虚线),与 par 同长度,已在调用前完成 log10(phis) 变换
     bolupp: 是否使用 uniform prior 风格的标记（原为模块全局变量，现已参数化）
     '''
@@ -51,7 +55,7 @@ def plot2dposterior_withconf(dat, likli, indx=[], labels=[], rate=0.5,
     # --- 改进 1: 绘图范围分位数自动缩放 ---
     # 先验区间仍是外框（prior_rangedat 留作 1D 面板的先验边界参考线）；非
     # upper_only 参数改用后验 [0.5, 99.5]% 分位数缩放，直方图 100 个 bins 全部
-    # 花在后验核上而不是大片空白先验区。MAP 与注入真值线包进窗口（截断在先验
+    # 花在后验核上而不是大片空白先验区。max-L 与注入真值线包进窗口（截断在先验
     # 内）——恢复检验时真值线不会被裁掉，真值严重偏离时窗口随之拉大，本身就是
     # 可见的诊断。upper_only（如 log_E0 上限参数）保留全范围：贴边堆积本身就是
     # 结果，缩放会掩盖它。
@@ -146,7 +150,7 @@ def plot2dposterior_withconf(dat, likli, indx=[], labels=[], rate=0.5,
 
             if par.size > 0 and vari not in upper_only:
                 plt.plot([par[vari], par[vari]], [0, max(n)], ls='solid',
-                         color='k', linewidth=2, label='MAP')
+                         color='k', linewidth=2, label='max-L')
         else:
             if len(levels)>0:
                 for ls in [0.68, 0.95]:
@@ -181,12 +185,12 @@ def plot2dposterior_withconf(dat, likli, indx=[], labels=[], rate=0.5,
                         print(rv-par[vari], lv-par[vari])
             if par.size > 0:
                 plt.plot([par[vari], par[vari]], [0, max(n)], ls='solid',
-                         color='k', linewidth=2, label='MAP')
+                         color='k', linewidth=2, label='max-L')
 
         if truth_par is not None:
             plt.plot([truth_par[vari], truth_par[vari]], [0, max(n)], ls='dashed',
                      color='red', linewidth=2, label='injected truth')
-        # 数值不逐面板标注(实测会遮挡分布轮廓——用户反馈): MAP/true/UL95 汇总成
+        # 数值不逐面板标注(实测会遮挡分布轮廓——用户反馈): max-L/true/UL95 汇总成
         # 一张表, 与线型图例一起放左下角空三角区(见主循环外)。
 
         if len(parm) > 0:
@@ -280,7 +284,7 @@ def plot2dposterior_withconf(dat, likli, indx=[], labels=[], rate=0.5,
                            length=3, width=0.8, color='0.5')
 
     # 左下角【空面板三角区】放两张注记(对角线以下没有格子, 零遮挡):
-    #   底格: 线型图例; 上一格: 参数值表(MAP 列; upper_only 参数的黑线是
+    #   底格: 线型图例; 上一格: 参数值表(max-L 列; upper_only 参数的黑线是
     #   95% 上限, 值取 shown 样本的 95 分位)。数值逐面板标注会遮挡轮廓,
     #   集中成表后恢复检验时一处读全。
     if npar >= 2:
@@ -293,7 +297,7 @@ def plot2dposterior_withconf(dat, likli, indx=[], labels=[], rate=0.5,
         names = (list(PARAM_ORDER[:npar]) if npar <= len(PARAM_ORDER)
                  else ['p%d' % k for k in range(npar)])
         has_truth = truth_par is not None
-        lines = ['%-13s %9s' % ('param', 'MAP')]
+        lines = ['%-13s %9s' % ('param', 'max-L')]
         if has_truth:
             lines = ['%-13s %9s %9s' % ('param', 'MAP', 'true')]
         for k in range(npar):
@@ -309,7 +313,7 @@ def plot2dposterior_withconf(dat, likli, indx=[], labels=[], rate=0.5,
             else:
                 lines.append('%-13s %9s' % (names[k], v1))
         if par.size > 0 and len(upper_only) > 0:
-            lines.append('(MAP col = 95%% UL for: %s)'
+            lines.append('(max-L col = 95%% UL for: %s)'
                          % ', '.join(names[k] for k in sorted(upper_only)
                                      if k < npar))
         axt = plt.subplot(npar, npar, (npar - 2) * npar + 1)
@@ -355,27 +359,42 @@ if __name__ == '__main__':
         truth_par = truth_vector(args.truth_path)
         print(f'[truth] 注入真值(已 log10 phis): {truth_par}')
 
-    a = pymultinest.Analyzer(n_params = n_show, outputfiles_basename=fname)
-    b = a.get_equal_weighted_posterior()
+    # 溯源校验(C1): 有 manifest 则验链与当前 config 同源并把 run tag 打进标题;
+    # 无 manifest 明说未校验(旧链不冒充校验过)。
+    note, mwarn = manifest_plot_note(fname, cfg)
+    if mwarn:
+        print(mwarn)
+    elif note:
+        print('[pltpost] manifest 校验通过: 链与当前 config 同源')
+    tit = (tit or '') + note
+
+    # 链读取不再依赖 pymultinest.Analyzer（2026-10-31 工程2 完整版）：
+    # post_equal_weights.dat 是纯文本（col0..7 = 参数（col0 线性 phis），末列 = logL），
+    # np.loadtxt 与 Analyzer.get_equal_weighted_posterior() 同构（列数断言钉住），
+    # 本地无 MultiNest 也能端到端出图。
+    b = np.loadtxt(str(fname) + 'post_equal_weights.dat', ndmin=2)
+    if b.ndim != 2 or b.shape[1] != n_show + 1:
+        raise ValueError("post_equal_weights 列数 %s ≠ 期望 %d（n_params+1），列约定变了？"
+                         % (b.shape, n_show + 1))
 
     vlik=b[:,-1]
     allres=b[:,:-1]
     mxchain = allres
     mxchain[:,0] = np.log10(mxchain[:,0])
-    vpar = mxchain[np.argmax(vlik),:]
+    vpar = mxchain[np.argmax(vlik),:]   # 最大似然样本, 非后验众数 ⇒ 标签/表头叫 max-L (C1)
     print(vpar)
 
     if bolout:
         plt.figure(figsize=(20, 16))
         plot2dposterior_withconf(mxchain, vlik, par=vpar, truth_par=truth_par, indx=[], rangedat=rdat, rate=1.0, levels=[0.68, 0.95],
-            labels=[r'$\log\,\phi_0$', r'$\gamma$', r'$\log E_{\rm char}$', r'$\log E_0$', r'$\mu_w$', r'$\sigma_w$', r'$\ln\mu_{\rm host}$', r'$\ln\sigma_{\rm host}$'],
+            labels=[PARAM_LABELS[k] for k in PARAM_ORDER[:n_show]],
             bolupp=bolupp, upper_only=upper_only)
         plt.suptitle(tit)
         plt.savefig(fout)
 
     else:
         plot2dposterior_withconf(mxchain, vlik, par=vpar, truth_par=truth_par, indx=[], rangedat=rdat, rate=1.0, levels=[0.68, 0.95],
-            labels=[r'$\log\,\phi_0$', r'$\gamma$', r'$\log E_{\rm char}$', r'$\log E_0$', r'$\mu_w$', r'$\sigma_w$', r'$\ln\mu_{\rm host}$', r'$\ln\sigma_{\rm host}$'],
+            labels=[PARAM_LABELS[k] for k in PARAM_ORDER[:n_show]],
             bolupp=bolupp, upper_only=upper_only)
         plt.suptitle(tit)
         plt.show()

@@ -275,7 +275,6 @@ def save_fits(result, fname, extra_header=None):
 
     hdu = fits.BinTableHDU.from_columns(cols)
     hdu.header['CATALOG'] = 'CHIME/FRB Catalog 2 (filtered)'
-    hdu.header['NAXIS2'] = len(result['fluence'])
     hdu.header['WUNIT'] = 'ms'
     if extra_header:
         for k, v in extra_header.items():
